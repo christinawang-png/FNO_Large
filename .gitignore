@@ -1,0 +1,6 @@
+*
+!.gitignore
+!bend_plane_params.py
+!bend_plane_params.py
+!submit1.slurm
+!submit2.slurm
