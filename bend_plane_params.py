@@ -18,6 +18,7 @@ import csv
 import numpy as np
 from skimage.measure import marching_cubes
 from pathlib import Path
+from scipy.interpolate import RectBivariateSpline
 
 # ==============================
 # CONFIGURATION
@@ -58,6 +59,29 @@ COEFF_STD = 1.0
 # BENT PLANE VOLUME
 # ==============================
 
+def make_bspline_heightfield(control_grid, xs, ys, kx=3, ky=3):
+    """
+    control_grid: (Ny_ctrl, Nx_ctrl) array of control point heights
+    xs: 1D array of x positions in [0,1], length nx
+    ys: 1D array of y positions in [0,1], length ny
+
+    Returns f_xy: (nx, ny) B-spline surface evaluated on xs, ys.
+    """
+    Ny_ctrl, Nx_ctrl = control_grid.shape
+
+    # parameter positions of control points (uniform in [0,1])
+    x_ctrl = np.linspace(0.0, 1.0, Nx_ctrl)
+    y_ctrl = np.linspace(0.0, 1.0, Ny_ctrl)
+
+    # create spline
+    spline = RectBivariateSpline(x_ctrl, y_ctrl, control_grid.T, kx=kx, ky=ky)
+    # NOTE: RectBivariateSpline expects axes order (x, y) with z[x_idx, y_idx],
+    # so we supply control_grid.T above.
+
+    # evaluate on full grid
+    f_xy = spline(xs, ys)  # shape (nx, ny)
+    return f_xy
+
 def volume_bent_plane(p1, p2, nx, ny, nz,
                       sigma=0.02,
                       use_signed_dist=True):
@@ -74,16 +98,27 @@ def volume_bent_plane(p1, p2, nx, ny, nz,
     ys = np.linspace(0.0, 1.0, ny)
     zs = np.linspace(0.0, 1.0, nz)
 
-    X, Y, Z = np.meshgrid(xs, ys, zs, indexing="ij")  # (nx, ny, nz)
+    X, Y, Z = np.meshgrid(xs, ys, zs, indexing="ij")
 
-    # Centered coordinates
-    x0, y0 = 0.5, 0.5
-    fx = X - x0
-    fy = Y - y0
+    # ---- NEW: B-spline height field instead of quadratic ----
+    # Build a small control grid of heights (e.g., 4x4) per (p1,p2).
+    # Use p1,p2 to seed randomness so it's deterministic.
+    rng = np.random.RandomState(seed=int((p1 + 2) * 1000 + (p2 + 2) * 2000))
 
-    # Quadratic surface:
+    Ny_ctrl, Nx_ctrl = 4, 4
+    # base height plus small random perturbations
     base = 0.3
-    f_xy = base + p1 * (fx ** 2) + p2 * (fy ** 2)
+    ctrl_amp = 0.15  # how wiggly the surface is
+    control_grid = base + ctrl_amp * rng.randn(Ny_ctrl, Nx_ctrl).astype(np.float32)
+
+    # optional: bias control grid slightly with p1,p2 to keep some global trend
+    control_grid += 0.05 * p1 * np.linspace(-1, 1, Nx_ctrl)[None, :]
+    control_grid += 0.05 * p2 * np.linspace(-1, 1, Ny_ctrl)[:, None]
+
+    # evaluate B-spline surface on (xs, ys)
+    f_xy_2d = make_bspline_heightfield(control_grid, xs, ys)  # (nx, ny)
+    f_xy = f_xy_2d[:, :, None]  # broadcast over z
+    # ---------------------------------------------------------
 
     # Signed "distance" along z
     d = Z - f_xy
@@ -92,10 +127,9 @@ def volume_bent_plane(p1, p2, nx, ny, nz,
         V = d
     else:
         sigma = float(sigma)
-        d_pos = np.maximum(d, 0.0)   # only one side of the plane
-        V = np.exp(-0.5 * (d_pos / sigma) ** 2)  # (0, 1]
+        V = np.exp(-0.5 * (d / sigma) ** 2)
 
-    return V, xs, ys, zs
+    return V, xs, ys, zs, control_grid
 
 # ==============================
 # MAIN
@@ -128,10 +162,10 @@ def main():
                 sample_id += 1
 
                 # 1) build bent-plane volume
-                V, xs, ys, zs = volume_bent_plane(
+                V, xs, ys, zs, control_grid = volume_bent_plane(
                     p1, p2, GRID_NX, GRID_NY, GRID_NZ,
-                    sigma=0.05,          # controls volumetric thickness
-                    use_signed_dist=False,
+                    sigma=0.02,
+                    use_signed_dist=True,   # or False if you want Gaussian
                 )
 
                 # 2) marching cubes
@@ -146,7 +180,8 @@ def main():
 
                 # For this dataset, coeffs are just [p1, p2] as a placeholder.
                 # Training will use p1, p2 from metadata, not this file.
-                C = np.array([p1, p2], dtype=np.float32)
+                # You can still store p1,p2, but also store the control grid as the true shape params
+                C = control_grid.astype(np.float32)  # shape (Ny_ctrl, Nx_ctrl)
                 np.save(coeff_path, C)
 
                 np.save(vol_path, V)
