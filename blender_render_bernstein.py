@@ -25,20 +25,24 @@ VOLUME_METADATA_CSV = os.path.join(BASE_DIR, "metadata_volumes.csv")
 RENDER_DIR = os.path.join(BASE_DIR, "renders")
 os.makedirs(RENDER_DIR, exist_ok=True)
 
-# camera sphere params
-RADIUS = 1.5
-NUM_PHI = 6
-NUM_THETA = 12
+# ENV
+NUM_GLOBAL_ENVS    = 32          # instead of 128
+NUM_ENVS_PER_SHAPE = 8           # 8 different envs per shape
 
-# material param ranges (continuous color via hue)
-HUE_VALUES       = [0.0]                  # fixed color
-METALLIC_VALUES  = [0.0, 1.0]             # plastic vs metal
-ROUGHNESS_VALUES = [0.1, 0.5, 0.9]   # main variation
-SPECULAR_VALUES  = [0.5]                  # fixed
+# MATERIALS
+HUE_VALUES       = [0.0, 1/3, 2/3]  # red, green, blue-ish
+SAT_VALUES       = [0.4, 0.8]       # muted / saturated
+METALLIC_VALUES  = [0.0, 1.0]       # plastic / metal
+ROUGHNESS_VALUES = [0.2, 0.6]       # semi-gloss / rough
+SPECULAR_VALUES  = [0.5]            # fixed
+OPACITY_VALUES   = [1.0, 0.3]       # opaque / semi
+
+# CAMERA
+RADIUS_VALUES = [0.8, 1.1]                       # close / mid
 
 # render settings
-RES_X = 128
-RES_Y = 128
+RES_X = 64
+RES_Y = 64
 SAMPLES = 64
 
 # ==============================
@@ -53,12 +57,12 @@ ENV_W = 32   # envmap width  (equirectangular)
 SH_ORDER = 2  # spherical harmonic order (2 -> 9 coeffs)
 
 
+
 # ==============
 # ENV SAMPLING
 # ==============
-
-NUM_GLOBAL_ENVS = 128        # total distinct environments
 NUM_ENVS_PER_SHAPE = NUM_GLOBAL_ENVS       # envs used per shape
+IMAGES_PER_SHAPE = 500
 
 # ==============================
 # UTILITIES
@@ -120,9 +124,9 @@ def set_camera_from_spherical(cam, radius, phi, theta):
     cam.location.y = y
     cam.location.z = z
 
-def make_material_from_params(hue, metallic, roughness, specular):
-    r, g, b = colorsys.hsv_to_rgb(hue, 0.8, 0.4)
-    base_color = (r, g, b, 1.0)
+def make_material_from_params(hue, saturation, metallic, roughness, specular, opacity):
+    r, g, b = colorsys.hsv_to_rgb(hue, saturation, 0.4)
+    base_color = (r, g, b, opacity)
 
     mat_name = f"Mat_h{hue:.2f}_m{metallic:.2f}_r{roughness:.2f}_s{specular:.2f}"
     mat = bpy.data.materials.new(name=mat_name)
@@ -140,6 +144,7 @@ def make_material_from_params(hue, metallic, roughness, specular):
     bsdf.inputs["Base Color"].default_value = base_color
     bsdf.inputs["Metallic"].default_value   = metallic
     bsdf.inputs["Roughness"].default_value  = roughness
+    bsdf.inputs["Alpha"].default_value      = opacity
 
     # Set specular-like control depending on available socket
     if "Specular" in bsdf.inputs:
@@ -188,23 +193,6 @@ def set_env_texture(scene, image_path, strength=1.0):
 
     links.new(env_tex.outputs["Color"], bg.inputs["Color"])
     links.new(bg.outputs["Background"], world_output.inputs["Surface"])
-
-def generate_random_envmap(H, W):
-    """
-    Generate a simple random environment map for testing.
-    Shape: (H, W, 3), float32 in [0, 1].
-    You can replace this with something more structured later.
-    """
-    # Low-frequency random by upsampling a tiny random grid
-    small_h, small_w = 4, 8
-    base = np.random.rand(small_h, small_w, 3).astype(np.float32)
-
-    # Nearest-neighbor upscale to (H, W)
-    ys = (np.linspace(0, small_h - 1, H)).astype(np.int32)
-    xs = (np.linspace(0, small_w - 1, W)).astype(np.int32)
-    env = base[ys[:, None], xs[None, :], :]  # (H, W, 3)
-    return env
-
 
 def save_envmap(env, filepath):
     """
@@ -349,105 +337,13 @@ def sh_for_global_env(env_id, order=2):
 
 def env_ids_for_shape(sample_id):
     """
-    Deterministically pick NUM_ENVS_PER_SHAPE env_ids for this sample_id
+    Pick NUM_ENVS_PER_SHAPE env_ids for this sample_id
     from 0..NUM_GLOBAL_ENVS-1, spread along the snake.
     """
     base = (sample_id * 7) % NUM_GLOBAL_ENVS
     step = max(1, NUM_GLOBAL_ENVS // NUM_ENVS_PER_SHAPE)
     ids = [ (base + k * step) % NUM_GLOBAL_ENVS for k in range(NUM_ENVS_PER_SHAPE) ]
     return ids
-
-
-def project_env_to_sh(env, order=3):
-    """
-    Project an equirectangular envmap to SH coefficients.
-    env: (H, W, 3), float32 in [0,1], representing radiance over directions.
-         v in [0,1] -> theta in [0, pi]
-         u in [0,1] -> phi in [0, 2*pi]
-    Returns coeffs: (num_coeffs, 3) for RGB.
-    """
-    H, W, _ = env.shape
-    pairs = sh_lm_list(order)
-    num_coeffs = len(pairs)
-
-    coeffs = np.zeros((num_coeffs, 3), dtype=np.float64)
-
-    dtheta = math.pi / H
-    dphi = 2.0 * math.pi / W
-
-    for y in range(H):
-        # center of pixel in theta
-        theta = (y + 0.5) * dtheta
-        sin_theta = math.sin(theta)
-        for x in range(W):
-            phi = (x + 0.5) * dphi
-
-            # direction on unit sphere
-            st = sin_theta
-            ct = math.cos(theta)
-            cp = math.cos(phi)
-            sp = math.sin(phi)
-            vx = st * cp
-            vy = st * sp
-            vz = ct
-
-            L = env[y, x, :]  # RGB
-            if sin_theta < 1e-6:
-                continue
-
-            Y = sh_basis_dir_l2(vx, vy, vz)  # 9 basis values
-
-            weight = sin_theta * dtheta * dphi  # area element on sphere
-            coeffs += (Y[:, None] * L[None, :] * weight)
-
-    # coeffs now approximate integral over the sphere of L * Y_lm dω
-    # No additional normalization needed for our convention.
-    return coeffs.astype(np.float32)  # (num_coeffs, 3)
-
-def sh_for_shape_env(sample_id, env_id, order=2):
-    """
-    Env 'snake': env_id moves along a smooth curve through RGB & SH space.
-    Neighboring env_id are similar; over many env_id you cover a range.
-    """
-    pairs = sh_lm_list(order)
-    num_coeffs = len(pairs)
-    coeffs = np.zeros((num_coeffs, 3), dtype=np.float32)
-
-    # Base shape index (so different shapes get offset snakes)
-    base_t = float(sample_id) * 0.1
-
-    # Env parameter along the snake
-    k = float(env_id)
-    t = base_t + k * 0.2          # step size along curve
-    u = (k - 1) / max(1, NUM_ENVS_PER_SHAPE - 1)  # in [0,1]
-
-    # 1) Make RGB walk around a color wheel (slowly varying)
-    #    This gives you different color casts per env, but adjacent ones are close.
-    r = 0.5 + 0.4 * math.sin(t)
-    g = 0.5 + 0.4 * math.sin(t + 2.0 * math.pi / 3.0)
-    b = 0.5 + 0.4 * math.sin(t + 4.0 * math.pi / 3.0)
-    rgb_scale = np.array([r, g, b], dtype=np.float32)
-
-    # 2) Base ambient term (l=0,m=0): slightly colored
-    coeffs[0, :] = rgb_scale * 0.4
-
-    # 3) First-order band: direction varies smoothly with env
-    #    Interpret (u) as going around a small ellipsoid in SH(1) space.
-    for idx, (l, m) in enumerate(pairs):
-        if l == 1:
-            if m == -1:    # roughly Y
-                coeffs[idx, :] = rgb_scale * (0.2 * math.sin(2.0 * math.pi * u))
-            elif m == 0:   # roughly Z
-                coeffs[idx, :] = rgb_scale * (0.2 * math.cos(2.0 * math.pi * u))
-            elif m == 1:   # roughly X
-                coeffs[idx, :] = rgb_scale * (0.2 * math.sin(2.0 * math.pi * u + 1.0))
-
-    # 4) Small l=2 term to add variation without huge effect
-    for idx, (l, m) in enumerate(pairs):
-        if l == 2 and m == 0:
-            coeffs[idx, :] += rgb_scale * (0.05 * math.cos(4.0 * math.pi * u))
-
-    return coeffs
 
 # ==============================
 # MAIN
@@ -481,11 +377,14 @@ def main():
 
     # precompute camera angles (same as before)
     # single fixed camera angle
-    phi_fixed   = 0.5 * math.pi     # 90°, level with the object; tweak if needed
-    theta_fixed = math.radians(45)  # 45° around
+    phi_values   = [math.radians(45), math.radians(65)]
+    theta_values = [math.radians(t) for t in [0, 120, 240]]  # 3 azimuths
 
-    camera_angles = [(phi_fixed, theta_fixed)]
-
+    camera_poses = []
+    for radius in RADIUS_VALUES:
+        for phi in phi_values:
+            for theta in theta_values:
+                camera_poses.append((radius, phi, theta))
 
 
     # Precompute global env SH + envmaps
@@ -526,6 +425,7 @@ def main():
         "coeff_path",
         "mesh_path",
         "hue",
+        "saturation",
         "metallic",
         "roughness",
         "specular",
@@ -533,6 +433,7 @@ def main():
         "base_color_r",
         "base_color_g",
         "base_color_b",
+        "opacity",
         "phi",
         "theta",
         "radius",
@@ -591,71 +492,79 @@ def main():
                 bpy.data.objects.remove(o, do_unlink=True)
         cam = create_camera(scene, shape_obj)
 # -------- environments for this shape --------
-        env_ids = env_ids_for_shape(sample_id)  # e.g. range(NUM_GLOBAL_ENVS)
+# remove existing cameras, then create camera targeting this shape
 
-        for env_id in env_ids:
-            sh_coeffs = global_env_sh[env_id]
-            env_path = global_env_path[env_id]
+    # ---------- RANDOM SAMPLING PER SHAPE ----------
+    # Optional: seed per shape for reproducibility
+    rng = np.random.RandomState(sample_id)
 
-            # set world env for this image batch
-            set_env_texture(scene, env_path, strength=1.0)
+    for img_idx in range(IMAGES_PER_SHAPE):
+        # 1) Sample environment
+        env_id = int(rng.randint(0, NUM_GLOBAL_ENVS))
+        sh_coeffs = global_env_sh[env_id]
+        env_path  = global_env_path[env_id]
+        set_env_texture(scene, env_path, strength=1.0)
 
-            mat_id = 0
-            for hue in HUE_VALUES:
-                for metallic in METALLIC_VALUES:
-                    for roughness in ROUGHNESS_VALUES:
-                        for specular in SPECULAR_VALUES:
-                            mat_id += 1
-                            mat, base_color, material_type = make_material_from_params(
-                                float(hue),
-                                float(metallic),
-                                float(roughness),
-                                float(specular),
-                            )
-                            shape_obj.data.materials.clear()
-                            shape_obj.data.materials.append(mat)
+        # 2) Sample material parameters
+        hue        = float(rng.uniform(0.0, 1.0))            # full hue wheel
+        saturation = float(rng.uniform(0.3, 0.9))            # avoid extremes
+        metallic   = float(rng.choice([0.0, 1.0]))           # binary
+        roughness  = float(rng.uniform(0.1, 0.9))            # continuous
+        specular   = 0.5                                     # keep fixed
+        opacity    = float(rng.uniform([1.0, 0.1]))           # opaque / transparent
 
-                            cam_view_idx = 0
-                            for phi, theta in camera_angles:
-                                cam_view_idx += 1
-                                set_camera_from_spherical(cam, RADIUS, phi, theta)
+        mat, base_color, material_type = make_material_from_params(
+            hue, saturation, metallic, roughness, specular, opacity
+        )
+        shape_obj.data.materials.clear()
+        shape_obj.data.materials.append(mat)
 
-                                img_name = (
-                                    f"s{sample_id:04d}_e{env_id:03d}_m{mat_id:03d}_v{cam_view_idx:03d}.png"
-                                )
-                                img_path = os.path.join(RENDER_DIR, img_name)
+        # 3) Sample camera pose
+        radius = float(rng.uniform(0.8, 1.2))
+        phi    = float(rng.uniform(math.radians(35), math.radians(75)))
+        theta  = float(rng.uniform(0.0, 2.0 * math.pi))
 
-                                scene.render.filepath = img_path
-                                bpy.ops.render.render(write_still=True)
-                                print("Rendered:", img_path)
+        set_camera_from_spherical(cam, radius, phi, theta)
 
-                                row = {
-                                    "image_path": img_path,
-                                    "sample_id": sample_id,
-                                    "env_id": env_id,
-                                    "coeff_path": coeff_path,
-                                    "mesh_path": mesh_path,
-                                    "hue": float(hue),
-                                    "metallic": float(metallic),
-                                    "roughness": float(roughness),
-                                    "specular": float(specular),
-                                    "material_type": material_type,
-                                    "base_color_r": float(base_color[0]),
-                                    "base_color_g": float(base_color[1]),
-                                    "base_color_b": float(base_color[2]),
-                                    "phi": float(phi),
-                                    "theta": float(theta),
-                                    "radius": float(RADIUS),
-                                    "env_path": env_path,
-                                }
+        # 4) Render
+        img_name = f"s{sample_id:04d}_i{img_idx:05d}.png"
+        img_path = os.path.join(RENDER_DIR, img_name)
 
-                                for idx, (l, m) in enumerate(sh_pairs):
-                                    r_c, g_c, b_c = sh_coeffs[idx]
-                                    row[f"sh_l{l}_m{m}_r"] = float(r_c)
-                                    row[f"sh_l{l}_m{m}_g"] = float(g_c)
-                                    row[f"sh_l{l}_m{m}_b"] = float(b_c)
+        scene.render.filepath = img_path
+        bpy.ops.render.render(write_still=True)
+        print("Rendered:", img_path)
 
-                                writer.writerow(row)
+        # 5) Write metadata
+        row = {
+            "image_path": img_path,
+            "sample_id": sample_id,
+            "env_id": env_id,
+            "coeff_path": coeff_path,
+            "mesh_path": mesh_path,
+            "hue": float(hue),
+            "saturation": float(saturation),
+            "metallic": float(metallic),
+            "roughness": float(roughness),
+            "specular": float(specular),
+            "material_type": material_type,
+            "base_color_r": float(base_color[0]),
+            "base_color_g": float(base_color[1]),
+            "base_color_b": float(base_color[2]),
+            "opacity": float(opacity),
+            "phi": float(phi),
+            "theta": float(theta),
+            "radius": float(radius),
+            "env_path": env_path,
+        }
+
+        for idx, (l, m) in enumerate(sh_pairs):
+            r_c, g_c, b_c = sh_coeffs[idx]
+            row[f"sh_l{l}_m{m}_r"] = float(r_c)
+            row[f"sh_l{l}_m{m}_g"] = float(g_c)
+            row[f"sh_l{l}_m{m}_b"] = float(b_c)
+
+        writer.writerow(row)
+# -----------------------------------------------
     f_img.close()
     print("Done. Image metadata written to", IMAGE_METADATA_CSV)
 
