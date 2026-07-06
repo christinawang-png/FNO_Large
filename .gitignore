@@ -2,5 +2,6 @@
 !.gitignore
 !bend_plane_params.py
 !blender_render_bernstein.py
+!train.ipynb
 !submit1.slurm
 !submit2.slurm

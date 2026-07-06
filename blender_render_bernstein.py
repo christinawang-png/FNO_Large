@@ -17,12 +17,12 @@ import imageio  # pip install imageio in Blender's Python if you don't have it
 PROJECT_ROOT = Path(__file__).resolve().parent
 
 # Base directory created by generate_bernstein_meshes.py
-BASE_DIR = PROJECT_ROOT / "plane_dataset_1"
+BASE_DIR = PROJECT_ROOT / "plane_dataset_2"
 
 VOLUME_METADATA_CSV = os.path.join(BASE_DIR, "metadata_volumes.csv")
 
 # Where to write rendered images and image metadata
-RENDER_DIR = os.path.join(BASE_DIR, "renders")
+RENDER_DIR = os.path.join(BASE_DIR, "renders_larger")
 os.makedirs(RENDER_DIR, exist_ok=True)
 
 # ENV
@@ -496,74 +496,74 @@ def main():
 
     # ---------- RANDOM SAMPLING PER SHAPE ----------
     # Optional: seed per shape for reproducibility
-    rng = np.random.RandomState(sample_id)
+        rng = np.random.RandomState(sample_id)
 
-    for img_idx in range(IMAGES_PER_SHAPE):
-        # 1) Sample environment
-        env_id = int(rng.randint(0, NUM_GLOBAL_ENVS))
-        sh_coeffs = global_env_sh[env_id]
-        env_path  = global_env_path[env_id]
-        set_env_texture(scene, env_path, strength=1.0)
+        for img_idx in range(IMAGES_PER_SHAPE):
+            # 1) Sample environment
+            env_id = int(rng.randint(0, NUM_GLOBAL_ENVS))
+            sh_coeffs = global_env_sh[env_id]
+            env_path  = global_env_path[env_id]
+            set_env_texture(scene, env_path, strength=1.0)
 
-        # 2) Sample material parameters
-        hue        = float(rng.uniform(0.0, 1.0))            # full hue wheel
-        saturation = float(rng.uniform(0.3, 0.9))            # avoid extremes
-        metallic   = float(rng.choice([0.0, 1.0]))           # binary
-        roughness  = float(rng.uniform(0.1, 0.9))            # continuous
-        specular   = 0.5                                     # keep fixed
-        opacity    = float(rng.uniform([1.0, 0.1]))           # opaque / transparent
+            # 2) Sample material parameters
+            hue        = float(rng.uniform(0.0, 1.0))            # full hue wheel
+            saturation = float(rng.uniform(0.3, 0.9))            # avoid extremes
+            metallic   = float(rng.choice([0.0, 1.0]))           # binary
+            roughness  = float(rng.uniform(0.1, 0.9))            # continuous
+            specular   = 0.5                                     # keep fixed
+            opacity    = float(rng.uniform(1.0, 0.1))           # opaque / transparent
 
-        mat, base_color, material_type = make_material_from_params(
-            hue, saturation, metallic, roughness, specular, opacity
-        )
-        shape_obj.data.materials.clear()
-        shape_obj.data.materials.append(mat)
+            mat, base_color, material_type = make_material_from_params(
+                hue, saturation, metallic, roughness, specular, opacity
+            )
+            shape_obj.data.materials.clear()
+            shape_obj.data.materials.append(mat)
 
-        # 3) Sample camera pose
-        radius = float(rng.uniform(0.8, 1.2))
-        phi    = float(rng.uniform(math.radians(35), math.radians(75)))
-        theta  = float(rng.uniform(0.0, 2.0 * math.pi))
+            # 3) Sample camera pose
+            radius = float(rng.uniform(0.8, 1.2))
+            phi    = float(rng.uniform(math.radians(35), math.radians(75)))
+            theta  = float(rng.uniform(0.0, 2.0 * math.pi))
 
-        set_camera_from_spherical(cam, radius, phi, theta)
+            set_camera_from_spherical(cam, radius, phi, theta)
 
-        # 4) Render
-        img_name = f"s{sample_id:04d}_i{img_idx:05d}.png"
-        img_path = os.path.join(RENDER_DIR, img_name)
+            # 4) Render
+            img_name = f"s{sample_id:04d}_i{img_idx:05d}.png"
+            img_path = os.path.join(RENDER_DIR, img_name)
 
-        scene.render.filepath = img_path
-        bpy.ops.render.render(write_still=True)
-        print("Rendered:", img_path)
+            scene.render.filepath = img_path
+            bpy.ops.render.render(write_still=True)
+            print("Rendered:", img_path)
 
-        # 5) Write metadata
-        row = {
-            "image_path": img_path,
-            "sample_id": sample_id,
-            "env_id": env_id,
-            "coeff_path": coeff_path,
-            "mesh_path": mesh_path,
-            "hue": float(hue),
-            "saturation": float(saturation),
-            "metallic": float(metallic),
-            "roughness": float(roughness),
-            "specular": float(specular),
-            "material_type": material_type,
-            "base_color_r": float(base_color[0]),
-            "base_color_g": float(base_color[1]),
-            "base_color_b": float(base_color[2]),
-            "opacity": float(opacity),
-            "phi": float(phi),
-            "theta": float(theta),
-            "radius": float(radius),
-            "env_path": env_path,
-        }
+            # 5) Write metadata
+            row = {
+                "image_path": img_path,
+                "sample_id": sample_id,
+                "env_id": env_id,
+                "coeff_path": coeff_path,
+                "mesh_path": mesh_path,
+                "hue": float(hue),
+                "saturation": float(saturation),
+                "metallic": float(metallic),
+                "roughness": float(roughness),
+                "specular": float(specular),
+                "material_type": material_type,
+                "base_color_r": float(base_color[0]),
+                "base_color_g": float(base_color[1]),
+                "base_color_b": float(base_color[2]),
+                "opacity": float(opacity),
+                "phi": float(phi),
+                "theta": float(theta),
+                "radius": float(radius),
+                "env_path": env_path,
+            }
 
-        for idx, (l, m) in enumerate(sh_pairs):
-            r_c, g_c, b_c = sh_coeffs[idx]
-            row[f"sh_l{l}_m{m}_r"] = float(r_c)
-            row[f"sh_l{l}_m{m}_g"] = float(g_c)
-            row[f"sh_l{l}_m{m}_b"] = float(b_c)
+            for idx, (l, m) in enumerate(sh_pairs):
+                r_c, g_c, b_c = sh_coeffs[idx]
+                row[f"sh_l{l}_m{m}_r"] = float(r_c)
+                row[f"sh_l{l}_m{m}_g"] = float(g_c)
+                row[f"sh_l{l}_m{m}_b"] = float(b_c)
 
-        writer.writerow(row)
+            writer.writerow(row)
 # -----------------------------------------------
     f_img.close()
     print("Done. Image metadata written to", IMAGE_METADATA_CSV)

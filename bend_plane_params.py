@@ -129,7 +129,8 @@ def volume_bent_plane(p1, p2, nx, ny, nz,
         V = d
     else:
         sigma = float(sigma)
-        V = np.exp(-0.5 * (d / sigma) ** 2)
+        d_pos = np.maximum(d, 0.0) 
+        V = np.exp(-0.5 * (d_pos / sigma) ** 2)
 
     return V, xs, ys, zs, control_grid
 
