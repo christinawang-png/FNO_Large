@@ -4,6 +4,8 @@
 !blender_render_bernstein.py
 !train.ipynb
 !train.py
+!fine_tune_L1.py
+!compare.py
 !submit1.slurm
 !submit2.slurm
 !submit3.slurm

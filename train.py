@@ -240,7 +240,7 @@ def loss_fn(preds, targets):
 
 def main():
     base_dir = Path("./plane_dataset_2")
-    image_csv = base_dir / "renders_smaller" / "metadata_images_None.csv"   # or shard
+    image_csv = base_dir / "renders_larger" / "metadata_images_None.csv"   # or shard
     volume_csv = base_dir / "metadata_volumes.csv"
 
     full_dataset = PlaneDatasetParamsToImage(
@@ -270,8 +270,8 @@ def main():
     model = FNOPlusResNet(latent_dim=latent_dim, img_size=(64, 64)).to(device)
     print(f"Using device: {device}")
 
-    train_loader = DataLoader(train_dataset, batch_size=16, shuffle=True,  num_workers=2)
-    val_loader   = DataLoader(val_dataset,   batch_size=16, shuffle=False, num_workers=2)
+    train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True,  num_workers=2)
+    val_loader   = DataLoader(val_dataset,   batch_size=32, shuffle=False, num_workers=2)
 
     criterion = nn.MSELoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
@@ -354,7 +354,7 @@ def main():
             print("Saved val example:", fname)
 
     # save model + normalization stats
-    out_path = "fno_params_to_image.pt"
+    out_path = "fno_params_to_image_large.pt"
     torch.save({
         "model_state": model.state_dict(),
         "param_mean": full_dataset.param_mean,
