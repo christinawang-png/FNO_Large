@@ -22,7 +22,7 @@ BASE_DIR = PROJECT_ROOT / "plane_dataset_2"
 VOLUME_METADATA_CSV = os.path.join(BASE_DIR, "metadata_volumes.csv")
 
 # Where to write rendered images and image metadata
-RENDER_DIR = os.path.join(BASE_DIR, "renders_larger")
+RENDER_DIR = os.path.join(BASE_DIR, "renders_Larger")
 os.makedirs(RENDER_DIR, exist_ok=True)
 
 # ENV
