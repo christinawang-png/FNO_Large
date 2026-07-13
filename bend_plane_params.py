@@ -27,7 +27,7 @@ from scipy.interpolate import RectBivariateSpline
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 
-OUTPUT_DIR = PROJECT_ROOT / "plane_dataset_2"
+OUTPUT_DIR = PROJECT_ROOT / "plane_dataset_3"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 GRID_NX = 64
@@ -111,7 +111,7 @@ def volume_bent_plane(p1, p2, nx, ny, nz,
     )
 
     base = 0.3
-    ctrl_amp = 0.15
+    ctrl_amp = 0.03
     control_grid = base + ctrl_amp * rng.randn(NY_CTRL, NX_CTRL).astype(np.float32)
 
     # Slight global trend from p1, p2

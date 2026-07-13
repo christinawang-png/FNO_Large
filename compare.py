@@ -9,7 +9,7 @@ from train import PlaneDatasetParamsToImage, FNOPlusResNet
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 base_dir   = Path("./plane_dataset_2")
-image_csv  = base_dir / "renders_smaller" / "metadata_images_None.csv"
+image_csv  = base_dir / "renders_Larger" / "metadata_images_None.csv"
 volume_csv = base_dir / "metadata_volumes.csv"
 
 full_dataset = PlaneDatasetParamsToImage(
@@ -51,5 +51,5 @@ def eval_model(ckpt_path, tag):
             print(f"[{tag}] Saved:", fname)
 
 # run for base (MSE) and finetuned models
-eval_model("fno_params_to_image.pt", "mse")
-eval_model("fno_params_to_image_finetuned.pt", "finetune")
+eval_model("fno_params_to_image_large.pt", "mse")
+eval_model("fno_params_to_image_finetuned_large.pt", "finetune")

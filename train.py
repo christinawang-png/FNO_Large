@@ -240,7 +240,7 @@ def loss_fn(preds, targets):
 
 def main():
     base_dir = Path("./plane_dataset_2")
-    image_csv = base_dir / "renders_larger" / "metadata_images_None.csv"   # or shard
+    image_csv = base_dir / "renders_Larger" / "metadata_images_None.csv"   # or shard
     volume_csv = base_dir / "metadata_volumes.csv"
 
     full_dataset = PlaneDatasetParamsToImage(
