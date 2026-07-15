@@ -7,7 +7,10 @@
 !fine_tune_L1.py
 !compare.py
 !merge_metadata.py
+!wow_video.py
 !shape_count.py
 !submit1.slurm
 !submit2.slurm
 !submit3.slurm
+!submit4.slurm
+!submit5.slurm

@@ -18,11 +18,11 @@ def loss_fn(preds, targets):
 
 def main():
     # -------- paths & settings --------
-    base_dir   = Path("./plane_dataset_2")
-    image_csv  = base_dir / "renders_Larger" / "metadata_images_None.csv"
+    base_dir   = Path("./plane_dataset_3")
+    image_csv  = base_dir / "renders" / "metadata_images_all.csv"
     volume_csv = base_dir / "metadata_volumes.csv"
 
-    checkpoint_path = Path("fno_params_to_image_large.pt")  # your MSE-trained checkpoint
+    checkpoint_path = Path("fno_params_to_image_more_envs_120.pt")  # your MSE-trained checkpoint
     finetune_epochs = 30
     batch_size = 16
     val_frac = 0.1
@@ -147,7 +147,7 @@ def main():
             print("Saved finetune val example:", fname)
 
     # -------- save finetuned model --------
-    out_ckpt = "fno_params_to_image_finetuned_large.pt"
+    out_ckpt = "fno_params_to_image_more_envs_120_finetuned.pt"
     torch.save({
         "model_state": model.state_dict(),
         "param_mean":  full_dataset.param_mean,

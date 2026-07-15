@@ -17,6 +17,7 @@ import random
 
 from torch.utils.data import Dataset
 import torch.nn.functional as F
+import os
 
 
 # ==============================
@@ -288,11 +289,6 @@ def main():
         state = ckpt["model_state"]
         state.pop("_metadata", None)  # if needed
         model.load_state_dict(state)
-
-        optimizer.load_state_dict(ckpt["optimizer_state"])
-        start_epoch = ckpt.get("epoch", 0)
-        # optionally restore param_mean/param_std if you saved them here
-
         print("Resumed at epoch", start_epoch)
         
 
@@ -340,7 +336,6 @@ def main():
             torch.save({
                 "epoch": epoch + 1,
                 "model_state": model.state_dict(),
-                "optimizer_state": optimizer.state_dict(),
                 "param_mean": full_dataset.param_mean,
                 "param_std": full_dataset.param_std,
                 "latent_dim": latent_dim,
@@ -386,7 +381,7 @@ def main():
             print("Saved val example:", fname)
 
     # save model + normalization stats
-    out_path = "fno_params_to_image_more_envs_30.pt"
+    out_path = "fno_params_to_image_more_envs.pt"
     torch.save({
         "model_state": model.state_dict(),
         "param_mean": full_dataset.param_mean,

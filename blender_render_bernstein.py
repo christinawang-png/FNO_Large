@@ -521,7 +521,7 @@ def main():
 
             # 3) Sample camera pose
             radius = float(rng.uniform(0.8, 1.2))
-            phi    = float(rng.uniform(math.radians(35), math.radians(75)))
+            phi    = float(rng.uniform(0.0, math.pi))
             theta  = float(rng.uniform(0.0, 2.0 * math.pi))
 
             set_camera_from_spherical(cam, radius, phi, theta)
