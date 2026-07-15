@@ -239,8 +239,8 @@ def loss_fn(preds, targets):
 # ==============================
 
 def main():
-    base_dir = Path("./plane_dataset_2")
-    image_csv = base_dir / "renders_Larger" / "metadata_images_None.csv"   # or shard
+    base_dir = Path("./plane_dataset_3")
+    image_csv = base_dir / "renders" / "metadata_images_all.csv"   # or shard
     volume_csv = base_dir / "metadata_volumes.csv"
 
     full_dataset = PlaneDatasetParamsToImage(
@@ -275,9 +275,28 @@ def main():
 
     criterion = nn.MSELoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
-    num_epochs = 150
 
-    for epoch in range(num_epochs):
+    resume_path = "fno_params_to_image_more_envs_30.pt"  # or None
+    start_epoch = 30
+    num_epochs  = 150  # total epochs you want to reach
+
+    resume = True
+
+    if resume_path is not None and os.path.isfile(resume_path) and resume:
+        print("Resuming from", resume_path)
+        ckpt = torch.load(resume_path, map_location=device, weights_only=False)
+        state = ckpt["model_state"]
+        state.pop("_metadata", None)  # if needed
+        model.load_state_dict(state)
+
+        optimizer.load_state_dict(ckpt["optimizer_state"])
+        start_epoch = ckpt.get("epoch", 0)
+        # optionally restore param_mean/param_std if you saved them here
+
+        print("Resumed at epoch", start_epoch)
+        
+
+    for epoch in range(start_epoch, num_epochs):
         # ---- train ----
         model.train()
         total_train = 0.0
@@ -313,6 +332,19 @@ def main():
         if (epoch + 1) % 5 == 0:
             print(f"Epoch {epoch+1}/{num_epochs}, "
                 f"train_loss={avg_train:.6f}, val_loss={avg_val:.6f}")
+            
+        if (epoch + 1) % 30 == 0:
+            print(f"Epoch {epoch+1}/{num_epochs}, train_loss={avg_train:.6f}, val_loss={avg_val:.6f}")
+            # save checkpoint
+            ckpt_path = f"fno_params_to_image_more_envs_{epoch+1:03d}.pt"
+            torch.save({
+                "epoch": epoch + 1,
+                "model_state": model.state_dict(),
+                "optimizer_state": optimizer.state_dict(),
+                "param_mean": full_dataset.param_mean,
+                "param_std": full_dataset.param_std,
+                "latent_dim": latent_dim,
+            }, ckpt_path)
     # ==============================
     # Quick qualitative check: GT vs Pred
     # ==============================
@@ -354,7 +386,7 @@ def main():
             print("Saved val example:", fname)
 
     # save model + normalization stats
-    out_path = "fno_params_to_image_large.pt"
+    out_path = "fno_params_to_image_more_envs_30.pt"
     torch.save({
         "model_state": model.state_dict(),
         "param_mean": full_dataset.param_mean,

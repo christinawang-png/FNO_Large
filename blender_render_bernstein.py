@@ -17,16 +17,16 @@ import imageio  # pip install imageio in Blender's Python if you don't have it
 PROJECT_ROOT = Path(__file__).resolve().parent
 
 # Base directory created by generate_bernstein_meshes.py
-BASE_DIR = PROJECT_ROOT / "plane_dataset_2"
+BASE_DIR = PROJECT_ROOT / "plane_dataset_3"
 
 VOLUME_METADATA_CSV = os.path.join(BASE_DIR, "metadata_volumes.csv")
 
 # Where to write rendered images and image metadata
-RENDER_DIR = os.path.join(BASE_DIR, "renders_Larger")
+RENDER_DIR = os.path.join(BASE_DIR, "renders")
 os.makedirs(RENDER_DIR, exist_ok=True)
 
 # ENV
-NUM_GLOBAL_ENVS    = 32          # instead of 128
+NUM_GLOBAL_ENVS    = 128          # instead of 128
 NUM_ENVS_PER_SHAPE = 8           # 8 different envs per shape
 
 # MATERIALS
