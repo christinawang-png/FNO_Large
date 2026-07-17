@@ -249,6 +249,8 @@ def main():
     start_id = None
     end_id = None
     job_id = "job0"  # default
+    temp_dir = os.path.join(RENDER_DIR, f"_tmp_{job_id}")
+    os.makedirs(temp_dir, exist_ok=True)
 
     argv = sys.argv[sys.argv.index("--") + 1:] if "--" in sys.argv else []
     if "--start_id" in argv:
@@ -380,16 +382,35 @@ def main():
             set_camera_from_spherical(cam, radius, phi, theta)
 
             # 4) render (no file)
-            bpy.ops.render.render(write_still=False)
-            render_result = bpy.data.images['Render Result']
-            w, h = render_result.size
-            buf = np.array(render_result.pixels[:], dtype=np.float32)
-            buf = buf.reshape((h, w, 4))[:, :, :3]
-            img_np = np.transpose(buf, (2, 0, 1))  # [3,H,W]
+            pid = os.getpid()
+            tmp_name = f"_tmp_{job_id}_{pid}_s{sample_id:04d}_i{img_idx:05d}.png"
+            tmp_path = os.path.join(temp_dir, tmp_name)
+            
+            scene.render.filepath = tmp_path
+            scene.render.use_file_extension = True
 
-            # store in shard
-            shard_array[current_shard_count] = img_np
+            bpy.ops.render.render(write_still=True)
 
+            # load temp PNG as NumPy
+
+            img = imageio.imread(tmp_path)  # H,W,3 or H,W,4
+            if img.ndim == 3 and img.shape[2] == 4:
+                img = img[:, :, :3]  # drop alpha
+            img = img.astype(np.float32) / 255.0  # [0,1]
+
+            # ensure correct size
+            h, w, _ = img.shape
+            if h != RES_Y or w != RES_X:
+                # resize with simple numpy or skip if you want strict guarantee
+                print(f"[WARN] Got render size ({w},{h}), expected ({RES_X},{RES_Y}); skipping frame")
+                os.remove(tmp_path)
+                continue
+
+            # convert to [3,H,W]
+            img_np = np.transpose(img, (2, 0, 1))
+
+            # delete temp file
+            os.remove(tmp_path)
             row = {
                 "sample_id": sample_id,
                 "env_id": env_id,
