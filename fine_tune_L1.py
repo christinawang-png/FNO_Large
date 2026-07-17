@@ -10,7 +10,7 @@ from torch.utils.data import DataLoader, random_split
 from torchvision.utils import save_image
 
 # adjust this import to wherever you defined these
-from train import PlaneDatasetParamsToImage, FNOPlusResNet  
+from train import PlaneDatasetParamsToImageSharded, FNOPlusResNet  
 
 def loss_fn(preds, targets):
     # mixed L1 + MSE
@@ -22,7 +22,7 @@ def main():
     image_csv  = base_dir / "renders" / "metadata_images_all.csv"
     volume_csv = base_dir / "metadata_volumes.csv"
 
-    checkpoint_path = Path("fno_params_to_image_more_envs_120.pt")  # your MSE-trained checkpoint
+    checkpoint_path = Path("fno_params_to_image_cameras_100.pt")  # your MSE-trained checkpoint
     finetune_epochs = 30
     batch_size = 16
     val_frac = 0.1
@@ -32,13 +32,15 @@ def main():
     print("Using device:", device)
 
     # -------- dataset & split --------
-    full_dataset = PlaneDatasetParamsToImage(
+    full_dataset = PlaneDatasetParamsToImageSharded(
         image_csv_path=str(image_csv),
         volume_csv_path=str(volume_csv),
-        img_size=(64, 64),
+        img_size=(64,64),
         use_sh=True,
         normalize_params=True,
+        shards_dir=str(base_dir),  # wherever you saved images_64x64_shard_*.npy
     )
+
     latent_dim = full_dataset.latent_dim
     N = len(full_dataset)
     N_val = int(N * val_frac)
@@ -147,7 +149,7 @@ def main():
             print("Saved finetune val example:", fname)
 
     # -------- save finetuned model --------
-    out_ckpt = "fno_params_to_image_more_envs_120_finetuned.pt"
+    out_ckpt = "fno_params_to_image_cameras_100_finetuned.pt"
     torch.save({
         "model_state": model.state_dict(),
         "param_mean":  full_dataset.param_mean,

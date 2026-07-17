@@ -3,7 +3,7 @@
 #SBATCH --nodes=1
 #SBATCH --partition=mit_normal
 #SBATCH --cpus-per-task=24
-#SBATCH --mem=20G
+#SBATCH --mem=40G
 #SBATCH --time=12:00:00
 
 cd "$HOME"

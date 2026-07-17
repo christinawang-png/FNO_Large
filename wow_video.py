@@ -133,7 +133,7 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = FNOPlusResNet(latent_dim=latent_dim, img_size=(64, 64)).to(device)
 
-    ckpt = torch.load("fno_params_to_image_more_envs_120_finetuned.pt", map_location=device, weights_only=False)
+    ckpt = torch.load("fno_params_to_image_cameras_100.pt", map_location=device, weights_only=False)
     state = ckpt["model_state"]
     state.pop("_metadata", None)
     model.load_state_dict(state)
@@ -146,9 +146,9 @@ def main():
     num_frames = 120
     fps = 12
 
-    out_dir = Path("wow_video3_frames")
+    out_dir = Path("wow_video4_frames")
     out_dir.mkdir(parents=True, exist_ok=True)
-    video_path = Path("wow_video3.mp4")
+    video_path = Path("wow_video4.mp4")
 
     with torch.no_grad(), imageio.get_writer(video_path, fps=fps) as writer:
         for i in range(num_frames):
@@ -194,6 +194,7 @@ def main():
             phi_amp    = math.radians(25)  # swing ±25°
 
             phi = phi_center + phi_amp * math.sin(2.0 * math.pi * t)
+            phi = math.radians(65)
             radius = 1.2 + 0.3 * math.sin(2.0 * math.pi * t)
             # radius in [1.3, 1.5] instead of [0.8, 1.2]
 

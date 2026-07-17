@@ -119,47 +119,29 @@ class FNOPlusResNet(nn.Module):
 # ==============================
 
 
-class PlaneDatasetParamsToImage(Dataset):
-    """
-    Inputs per image:
-      [p1, p2, sigma,
-       hue, saturation, metallic, roughness, opacity, specular,
-       sin(phi), cos(phi), sin(theta), cos(theta),
-       radius,
-       (optional) flattened SH coeffs]
-
-    Output:
-      RGB image [3, H, W] in [0,1].
-    """
+class PlaneDatasetParamsToImageSharded(Dataset):
     def __init__(self,
                  image_csv_path,
                  volume_csv_path,
                  img_size=(64, 64),
                  use_sh=True,
-                 normalize_params=True):
+                 normalize_params=True,
+                 shards_dir=None):
         self.df_img = pd.read_csv(image_csv_path)
         self.img_size = img_size
         self.use_sh = use_sh
         self.normalize_params = normalize_params
 
-        # Load volume metadata, key by sample_id
-        df_vol = pd.read_csv(volume_csv_path)
-        df_vol = df_vol.set_index("sample_id")
-        # store only the columns we care about
+        # load volume metadata + build param_mean/param_std as before
+        df_vol = pd.read_csv(volume_csv_path).set_index("sample_id")
         self.shape_meta = df_vol[["p1", "p2", "sigma"]].to_dict("index")
 
-        self.transform = transforms.Compose([
-            transforms.Resize(img_size),
-            transforms.ToTensor(),   # [0,1]
-        ])
-
-        # --- build matrix of all param vectors for normalization ---
+        # build param stats (same code you had before)
         param_list = []
         for _, row in self.df_img.iterrows():
             param_list.append(self._build_param_vector_np(row))
-        vals = np.stack(param_list, axis=0)  # [N, D]
+        vals = np.stack(param_list, axis=0)
         self.latent_dim = vals.shape[1]
-
         if normalize_params:
             self.param_mean = vals.mean(axis=0)
             self.param_std  = vals.std(axis=0) + 1e-6
@@ -167,29 +149,35 @@ class PlaneDatasetParamsToImage(Dataset):
             self.param_mean = np.zeros(self.latent_dim, dtype=np.float32)
             self.param_std  = np.ones(self.latent_dim, dtype=np.float32)
 
+        # load shards (memory-mapped)
+        if shards_dir is None:
+            shards_dir = Path(image_csv_path).parent.parent  # base_dir
+        else:
+            shards_dir = Path(shards_dir)
+
+        self.shards = {}
+        for shard_id in sorted(self.df_img["shard_id"].unique()):
+            shard_path = shards_dir / f"images_64x64_shard_{shard_id:02d}.npy"
+            self.shards[int(shard_id)] = np.load(shard_path, mmap_mode="r")
+
     def __len__(self):
         return len(self.df_img)
 
     def _build_param_vector_np(self, row):
-        # --- shape parameters from volume metadata ---
+        # same as in your non-sharded PlaneDatasetParamsToImage:
+        # use row["sample_id"], row["hue"], row["saturation"], row["metallic"], ...
         sid = int(row["sample_id"])
-        shp = self.shape_meta[sid]  # dict with keys 'p1','p2','sigma'
-        p1 = float(shp["p1"])
-        p2 = float(shp["p2"])
-        sigma = float(shp["sigma"])
-
-        # --- material parameters from render CSV ---
+        shp = self.shape_meta[sid]
+        p1 = float(shp["p1"]); p2 = float(shp["p2"]); sigma = float(shp["sigma"])
         hue        = float(row["hue"])
         saturation = float(row["saturation"])
         metallic   = float(row["metallic"])
         roughness  = float(row["roughness"])
         opacity    = float(row["opacity"])
         specular   = float(row["specular"])
-
-        # --- camera parameters (use sin/cos) ---
-        phi   = float(row["phi"])
-        theta = float(row["theta"])
-        radius = float(row["radius"])
+        phi        = float(row["phi"])
+        theta      = float(row["theta"])
+        radius     = float(row["radius"])
         sin_phi, cos_phi = math.sin(phi), math.cos(phi)
         sin_th, cos_th   = math.sin(theta), math.cos(theta)
 
@@ -199,34 +187,25 @@ class PlaneDatasetParamsToImage(Dataset):
             sin_phi, cos_phi, sin_th, cos_th,
             radius,
         ]
-
-        # --- optional: append SH coeffs for environment ---
         if self.use_sh:
-            # you used sh_l{l}_m{m}_{r,g,b} in the CSV
-            sh_vals = []
-            # SH_ORDER=2 -> (0,0),(1,-1),(1,0),(1,1),(2,-2)...(2,2)
-            # you can either hard-code this or reconstruct from your sh_lm_list
             for col in self.df_img.columns:
                 if col.startswith("sh_l") and col.endswith(("_r", "_g", "_b")):
-                    sh_vals.append(float(row[col]))
-            # sort for consistency (optional but good)
-            # e.g. sort by l,m, then channel
-            # Here: cols are already in order from how you wrote fieldnames, so can skip.
-            scalars.extend(sh_vals)
-
+                    scalars.append(float(row[col]))
         return np.array(scalars, dtype=np.float32)
 
     def __getitem__(self, idx):
         row = self.df_img.iloc[idx]
 
-        # image
-        img = Image.open(row["image_path"]).convert("RGB")
-        img = self.transform(img)  # [3,H,W]
+        # image from shard
+        shard_id = int(row["shard_id"])
+        local_i  = int(row["idx_in_shard"])
+        img_np   = self.shards[shard_id][local_i]   # [3,H,W], float32
+        img      = torch.from_numpy(img_np)         # [3,H,W]
 
         # params
         scalars_np = self._build_param_vector_np(row)
         scalars_np = (scalars_np - self.param_mean) / self.param_std
-        param_vec = torch.from_numpy(scalars_np)  # [latent_dim]
+        param_vec  = torch.from_numpy(scalars_np)   # [latent_dim]
 
         return param_vec, img
     
@@ -244,12 +223,13 @@ def main():
     image_csv = base_dir / "renders" / "metadata_images_all.csv"   # or shard
     volume_csv = base_dir / "metadata_volumes.csv"
 
-    full_dataset = PlaneDatasetParamsToImage(
+    full_dataset = PlaneDatasetParamsToImageSharded(
         image_csv_path=str(image_csv),
         volume_csv_path=str(volume_csv),
-        img_size=(64, 64),
+        img_size=(64,64),
         use_sh=True,
         normalize_params=True,
+        shards_dir=str(base_dir),  # wherever you saved images_64x64_shard_*.npy
     )
 
     N = len(full_dataset)
@@ -278,10 +258,10 @@ def main():
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
 
     resume_path = "fno_params_to_image_more_envs_30.pt"  # or None
-    start_epoch = 30
+    start_epoch = 0
     num_epochs  = 150  # total epochs you want to reach
 
-    resume = True
+    resume = False
 
     if resume_path is not None and os.path.isfile(resume_path) and resume:
         print("Resuming from", resume_path)
@@ -329,10 +309,10 @@ def main():
             print(f"Epoch {epoch+1}/{num_epochs}, "
                 f"train_loss={avg_train:.6f}, val_loss={avg_val:.6f}")
             
-        if (epoch + 1) % 30 == 0:
-            print(f"Epoch {epoch+1}/{num_epochs}, train_loss={avg_train:.6f}, val_loss={avg_val:.6f}")
+        if (epoch + 1) % 10 == 0:
+            print(f"Epoch {epoch+1}/{num_epochs} Saved.")
             # save checkpoint
-            ckpt_path = f"fno_params_to_image_more_envs_{epoch+1:03d}.pt"
+            ckpt_path = f"fno_params_to_image_cameras_{epoch+1:03d}.pt"
             torch.save({
                 "epoch": epoch + 1,
                 "model_state": model.state_dict(),
@@ -381,7 +361,7 @@ def main():
             print("Saved val example:", fname)
 
     # save model + normalization stats
-    out_path = "fno_params_to_image_more_envs.pt"
+    out_path = "fno_params_to_image_cameras.pt"
     torch.save({
         "model_state": model.state_dict(),
         "param_mean": full_dataset.param_mean,

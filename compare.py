@@ -22,7 +22,7 @@ full_dataset = PlaneDatasetParamsToImage(
 latent_dim = full_dataset.latent_dim
 
 # fixed indices for comparison (choose once)
-fixed_indices = [10, 123, 456, 789]  # or random.sample(range(len(full_dataset)), 4)
+fixed_indices = random.sample(range(len(full_dataset)), 20)  # or random.sample(range(len(full_dataset)), 4)
 
 def load_model(ckpt_path):
     model = FNOPlusResNet(latent_dim=latent_dim, img_size=(64, 64)).to(device)
@@ -51,5 +51,5 @@ def eval_model(ckpt_path, tag):
             print(f"[{tag}] Saved:", fname)
 
 # run for base (MSE) and finetuned models
-eval_model("fno_params_to_image_more_envs_120.pt", "mse")
-eval_model("fno_params_to_image_more_envs_120_finetuned.pt", "finetune")
+eval_model("fno_params_to_image_cameras_100.pt", "camera")
+#eval_model("fno_params_to_image_more_envs_120_finetuned.pt", "finetune")

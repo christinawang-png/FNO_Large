@@ -9,6 +9,7 @@
 !merge_metadata.py
 !wow_video.py
 !shape_count.py
+!pack_dataset.py
 !submit1.slurm
 !submit2.slurm
 !submit3.slurm

@@ -36,4 +36,4 @@ print(incomplete.head())
 
 missing_sids = np.setdiff1d(all_sids, counts.index.values)
 print("Shapes with 0 images (missing):", len(missing_sids))
-print("First few missing:", missing_sids[:10])
+print("First few missing:", missing_sids)
