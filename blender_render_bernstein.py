@@ -7,7 +7,7 @@ import numpy as np
 import colorsys
 import sys
 from pathlib import Path
-import imageio
+import imageio.v2 as imageio
 import pandas as pd
 
 # ==============================
@@ -50,7 +50,7 @@ ENV_W = 32
 SH_ORDER = 2
 
 IMAGES_PER_SHAPE = 500
-SHARD_SIZE = 50000   # max images per shard
+SHARD_SIZE = 5000   # max images per shard
 
 # ==============================
 # UTILITIES
@@ -260,6 +260,11 @@ def main():
     if "--job_id" in argv:
         job_id = argv[argv.index("--job_id") + 1]
 
+    shard_base = 0
+    argv = sys.argv[sys.argv.index("--") + 1:] if "--" in sys.argv else []
+    if "--shard_base" in argv:
+        shard_base = int(argv[argv.index("--shard_base") + 1])
+
     scene = bpy.context.scene
     clean_scene()
 
@@ -385,7 +390,7 @@ def main():
             pid = os.getpid()
             tmp_name = f"_tmp_{job_id}_{pid}_s{sample_id:04d}_i{img_idx:05d}.png"
             tmp_path = os.path.join(temp_dir, tmp_name)
-            
+
             scene.render.filepath = tmp_path
             scene.render.use_file_extension = True
 
@@ -408,6 +413,7 @@ def main():
 
             # convert to [3,H,W]
             img_np = np.transpose(img, (2, 0, 1))
+            shard_array[current_shard_count] = img_np
 
             # delete temp file
             os.remove(tmp_path)
@@ -430,7 +436,7 @@ def main():
                 "theta": float(theta),
                 "radius": float(radius),
                 "env_path": env_path,
-                "shard_id": f"{job_id}_{current_shard_id}",
+                "shard_id": f"{job_id}_{shard_base + current_shard_id}",
                 "idx_in_shard": current_shard_count,
             }
             for idx_sh, (l, m) in enumerate(sh_pairs):
@@ -444,12 +450,12 @@ def main():
 
             # flush full shard
             if current_shard_count == SHARD_SIZE:
-                shard_name = f"images_64x64_{job_id}_shard_{current_shard_id:03d}.npy"
+                shard_name = f"images_64x64_{job_id}_shard_{shard_base + current_shard_id:03d}.npy"
                 shard_path = BASE_DIR / shard_name
                 np.save(shard_path, shard_array[:current_shard_count])
                 print("Saved shard:", shard_path)
 
-                csv_path = Path(RENDER_DIR) / f"metadata_{job_id}_shard_{current_shard_id:03d}.csv"
+                csv_path = Path(RENDER_DIR) / f"metadata_{job_id}_shard_{shard_base + current_shard_id:03d}.csv"
                 pd.DataFrame(rows).to_csv(csv_path, index=False)
                 print("Saved metadata:", csv_path)
 
@@ -459,12 +465,12 @@ def main():
 
     # save final partial shard
     if current_shard_count > 0:
-        shard_name = f"images_64x64_{job_id}_shard_{current_shard_id:03d}.npy"
+        shard_name = f"images_64x64_{job_id}_shard_{shard_base + current_shard_id:03d}.npy"
         shard_path = BASE_DIR / shard_name
         np.save(shard_path, shard_array[:current_shard_count])
         print("Saved final shard:", shard_path)
 
-        csv_path = Path(RENDER_DIR) / f"metadata_{job_id}_shard_{current_shard_id:03d}.csv"
+        csv_path = Path(RENDER_DIR) / f"metadata_{job_id}_shard_{shard_base + current_shard_id:03d}.csv"
         pd.DataFrame(rows).to_csv(csv_path, index=False)
         print("Saved metadata:", csv_path)
 
