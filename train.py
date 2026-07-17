@@ -97,7 +97,7 @@ class FNOPlusResNet(nn.Module):
         )
 
         # Image-space refiner
-        self.refiner = ImageRefiner(in_ch=3, hidden=32)
+        self.refiner = ImageRefiner(in_ch=3, hidden=64)
 
     def forward(self, params):
         B, D = params.shape
@@ -127,16 +127,16 @@ class PlaneDatasetParamsToImageSharded(Dataset):
                  use_sh=True,
                  normalize_params=True,
                  shards_dir=None):
-        self.df_img = pd.read_csv(image_csv_path)
+        self.df_img = pd.read_csv(image_csv_path, low_memory=False)
         self.img_size = img_size
         self.use_sh = use_sh
         self.normalize_params = normalize_params
 
-        # load volume metadata + build param_mean/param_std as before
+        # ----- volume metadata as before -----
         df_vol = pd.read_csv(volume_csv_path).set_index("sample_id")
         self.shape_meta = df_vol[["p1", "p2", "sigma"]].to_dict("index")
 
-        # build param stats (same code you had before)
+        # ----- build param stats (same as your non-sharded dataset) -----
         param_list = []
         for _, row in self.df_img.iterrows():
             param_list.append(self._build_param_vector_np(row))
@@ -149,23 +149,46 @@ class PlaneDatasetParamsToImageSharded(Dataset):
             self.param_mean = np.zeros(self.latent_dim, dtype=np.float32)
             self.param_std  = np.ones(self.latent_dim, dtype=np.float32)
 
-        # load shards (memory-mapped)
+        # ----- load shards (old + new), keyed by string shard_id -----
         if shards_dir is None:
-            shards_dir = Path(image_csv_path).parent.parent  # base_dir
+            shards_dir = Path(image_csv_path).parent.parent  # BASE_DIR
         else:
             shards_dir = Path(shards_dir)
 
-        self.shards = {}
-        for shard_id in sorted(self.df_img["shard_id"].unique()):
-            shard_path = shards_dir / f"images_64x64_shard_{shard_id:02d}.npy"
-            self.shards[int(shard_id)] = np.load(shard_path, mmap_mode="r")
+        # ensure shard_id is string
+        self.df_img["shard_id"] = self.df_img["shard_id"].astype(str)
+
+        self.shards = {}  # key: shard_id string
+        unique_ids = sorted(self.df_img["shard_id"].unique().tolist())
+
+        for sid in unique_ids:
+            if "_" in sid:
+                # NEW FORMAT: "job0_0" -> images_64x64_job0_shard_000.npy
+                job, local = sid.split("_")
+                local_id = int(local)
+                shard_name = f"images_64x64_{job}_shard_{local_id:03d}.npy"
+            else:
+                # OLD FORMAT: "0", "1", ... -> images_64x64_shard_00.npy (or similar)
+                old_id = int(sid)
+                shard_name = f"images_64x64_shard_{old_id:02d}.npy"  # adjust digits if needed
+
+            shard_path = shards_dir / shard_name
+            if not shard_path.is_file():
+                print(f"[WARN] shard file not found for shard_id={sid} -> {shard_path}")
+                continue
+
+            self.shards[sid] = np.load(shard_path, mmap_mode="r")
+
+        # Optionally drop rows whose shard_id we couldn't load
+        mask = self.df_img["shard_id"].isin(self.shards.keys())
+        self.df_img = self.df_img[mask].reset_index(drop=True)
+        print("Using rows:", len(self.df_img), "unique shard_ids:", len(self.shards))
 
     def __len__(self):
         return len(self.df_img)
 
     def _build_param_vector_np(self, row):
-        # same as in your non-sharded PlaneDatasetParamsToImage:
-        # use row["sample_id"], row["hue"], row["saturation"], row["metallic"], ...
+        # same as before: use sample_id, hue, saturation, metallic, roughness, opacity, phi/theta/radius, SH, etc.
         sid = int(row["sample_id"])
         shp = self.shape_meta[sid]
         p1 = float(shp["p1"]); p2 = float(shp["p2"]); sigma = float(shp["sigma"])
@@ -196,16 +219,15 @@ class PlaneDatasetParamsToImageSharded(Dataset):
     def __getitem__(self, idx):
         row = self.df_img.iloc[idx]
 
-        # image from shard
-        shard_id = int(row["shard_id"])
-        local_i  = int(row["idx_in_shard"])
-        img_np   = self.shards[shard_id][local_i]   # [3,H,W], float32
-        img      = torch.from_numpy(img_np)         # [3,H,W]
+        sid_str = str(row["shard_id"])      # "job0_0" or "0"
+        local_i = int(row["idx_in_shard"])
+        img_np  = self.shards[sid_str][local_i]   # [3,H,W]
 
-        # params
+        img = torch.from_numpy(img_np)
+
         scalars_np = self._build_param_vector_np(row)
         scalars_np = (scalars_np - self.param_mean) / self.param_std
-        param_vec  = torch.from_numpy(scalars_np)   # [latent_dim]
+        param_vec  = torch.from_numpy(scalars_np)
 
         return param_vec, img
     
@@ -220,7 +242,7 @@ def loss_fn(preds, targets):
 
 def main():
     base_dir = Path("./plane_dataset_3")
-    image_csv = base_dir / "renders" / "metadata_images_all.csv"   # or shard
+    image_csv = base_dir / "renders" / "metadata_images_all_combined.csv"   # or shard
     volume_csv = base_dir / "metadata_volumes.csv"
 
     full_dataset = PlaneDatasetParamsToImageSharded(

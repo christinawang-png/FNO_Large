@@ -7,7 +7,7 @@ from torchvision.utils import save_image
 import imageio.v2 as imageio
 
 # import your classes from training script/module
-from train import PlaneDatasetParamsToImage, FNOPlusResNet # adjust import path
+from train import PlaneDatasetParamsToImageSharded, FNOPlusResNet # adjust import path
 
 
 # ---------- Helper: build SH env from global "snake" (same as training) ----------
@@ -120,12 +120,13 @@ def main():
     image_csv  = base_dir / "renders" / "metadata_images_all.csv"
     volume_csv = base_dir / "metadata_volumes.csv"
 
-    dataset = PlaneDatasetParamsToImage(
+    dataset = PlaneDatasetParamsToImageSharded(
         image_csv_path=str(image_csv),
         volume_csv_path=str(volume_csv),
-        img_size=(64, 64),
+        img_size=(64,64),
         use_sh=True,
         normalize_params=True,
+        shards_dir=str(base_dir),  # wherever you saved images_64x64_shard_*.npy
     )
     latent_dim = dataset.latent_dim
 
@@ -133,7 +134,7 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = FNOPlusResNet(latent_dim=latent_dim, img_size=(64, 64)).to(device)
 
-    ckpt = torch.load("fno_params_to_image_cameras_100.pt", map_location=device, weights_only=False)
+    ckpt = torch.load("fno_params_to_image_cameras_100_finetuned.pt", map_location=device, weights_only=False)
     state = ckpt["model_state"]
     state.pop("_metadata", None)
     model.load_state_dict(state)

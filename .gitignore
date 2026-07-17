@@ -10,6 +10,7 @@
 !wow_video.py
 !shape_count.py
 !pack_dataset.py
+!merge_metadata_shards.py
 !submit1.slurm
 !submit2.slurm
 !submit3.slurm
