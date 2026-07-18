@@ -97,7 +97,7 @@ class FNOPlusResNet(nn.Module):
         )
 
         # Image-space refiner
-        self.refiner = ImageRefiner(in_ch=3, hidden=64)
+        self.refiner = ImageRefiner(in_ch=3, hidden=32)
 
     def forward(self, params):
         B, D = params.shape
@@ -132,22 +132,8 @@ class PlaneDatasetParamsToImageSharded(Dataset):
         self.use_sh = use_sh
         self.normalize_params = normalize_params
 
-        # ----- volume metadata as before -----
-        df_vol = pd.read_csv(volume_csv_path).set_index("sample_id")
-        self.shape_meta = df_vol[["p1", "p2", "sigma"]].to_dict("index")
-
-        # ----- build param stats (same as your non-sharded dataset) -----
-        param_list = []
-        for _, row in self.df_img.iterrows():
-            param_list.append(self._build_param_vector_np(row))
-        vals = np.stack(param_list, axis=0)
-        self.latent_dim = vals.shape[1]
-        if normalize_params:
-            self.param_mean = vals.mean(axis=0)
-            self.param_std  = vals.std(axis=0) + 1e-6
-        else:
-            self.param_mean = np.zeros(self.latent_dim, dtype=np.float32)
-            self.param_std  = np.ones(self.latent_dim, dtype=np.float32)
+        # ----- ensure shard_id is string -----
+        self.df_img["shard_id"] = self.df_img["shard_id"].astype(str)
 
         # ----- load shards (old + new), keyed by string shard_id -----
         if shards_dir is None:
@@ -155,12 +141,8 @@ class PlaneDatasetParamsToImageSharded(Dataset):
         else:
             shards_dir = Path(shards_dir)
 
-        # ensure shard_id is string
-        self.df_img["shard_id"] = self.df_img["shard_id"].astype(str)
-
         self.shards = {}  # key: shard_id string
         unique_ids = sorted(self.df_img["shard_id"].unique().tolist())
-
         for sid in unique_ids:
             if "_" in sid:
                 # NEW FORMAT: "job0_0" -> images_64x64_job0_shard_000.npy
@@ -173,22 +155,45 @@ class PlaneDatasetParamsToImageSharded(Dataset):
                 shard_name = f"images_64x64_shard_{old_id:02d}.npy"  # adjust digits if needed
 
             shard_path = shards_dir / shard_name
-            if not shard_path.is_file():
+            if shard_path.is_file():
+                self.shards[sid] = np.load(shard_path, mmap_mode="r")
+            else:
                 print(f"[WARN] shard file not found for shard_id={sid} -> {shard_path}")
-                continue
 
-            self.shards[sid] = np.load(shard_path, mmap_mode="r")
-
-        # Optionally drop rows whose shard_id we couldn't load
+        # drop rows whose shard_id we couldn't load, THEN reset index
         mask = self.df_img["shard_id"].isin(self.shards.keys())
         self.df_img = self.df_img[mask].reset_index(drop=True)
         print("Using rows:", len(self.df_img), "unique shard_ids:", len(self.shards))
+
+        # ----- volume metadata -----
+        df_vol = pd.read_csv(volume_csv_path).set_index("sample_id")
+        self.shape_meta = df_vol[["p1", "p2", "sigma"]].to_dict("index")
+
+        # ----- build param stats on FILTERED df_img -----
+        param_list = []
+        for _, row in self.df_img.iterrows():
+            param_list.append(self._build_param_vector_np(row))
+        vals = np.stack(param_list, axis=0)
+        self.latent_dim = vals.shape[1]
+
+        if normalize_params:
+            self.param_mean = vals.mean(axis=0)
+            self.param_std  = vals.std(axis=0) + 1e-6
+        else:
+            self.param_mean = np.zeros(self.latent_dim, dtype=np.float32)
+            self.param_std  = np.ones(self.latent_dim, dtype=np.float32)
+
+        # ----- precompute normalized param vectors -----
+        self.param_matrix = torch.empty((len(self.df_img), self.latent_dim), dtype=torch.float32)
+        for i, row in self.df_img.iterrows():
+            scalars_np = self._build_param_vector_np(row)
+            scalars_np = (scalars_np - self.param_mean) / self.param_std
+            self.param_matrix[i] = torch.from_numpy(scalars_np)
 
     def __len__(self):
         return len(self.df_img)
 
     def _build_param_vector_np(self, row):
-        # same as before: use sample_id, hue, saturation, metallic, roughness, opacity, phi/theta/radius, SH, etc.
         sid = int(row["sample_id"])
         shp = self.shape_meta[sid]
         p1 = float(shp["p1"]); p2 = float(shp["p2"]); sigma = float(shp["sigma"])
@@ -218,17 +223,11 @@ class PlaneDatasetParamsToImageSharded(Dataset):
 
     def __getitem__(self, idx):
         row = self.df_img.iloc[idx]
-
-        sid_str = str(row["shard_id"])      # "job0_0" or "0"
+        sid_str = str(row["shard_id"])
         local_i = int(row["idx_in_shard"])
-        img_np  = self.shards[sid_str][local_i]   # [3,H,W]
-
-        img = torch.from_numpy(img_np)
-
-        scalars_np = self._build_param_vector_np(row)
-        scalars_np = (scalars_np - self.param_mean) / self.param_std
-        param_vec  = torch.from_numpy(scalars_np)
-
+        img_np  = self.shards[sid_str][local_i]    # [3,H,W]
+        img     = torch.from_numpy(img_np.copy())  # make writable copy to avoid warnings
+        param_vec = self.param_matrix[idx]         # [latent_dim]
         return param_vec, img
     
 
@@ -273,13 +272,13 @@ def main():
     model = FNOPlusResNet(latent_dim=latent_dim, img_size=(64, 64)).to(device)
     print(f"Using device: {device}")
 
-    train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True,  num_workers=2)
-    val_loader   = DataLoader(val_dataset,   batch_size=32, shuffle=False, num_workers=2)
+    train_loader = DataLoader(train_dataset, batch_size=256, shuffle=True,  num_workers=4, pin_memory=True)
+    val_loader   = DataLoader(val_dataset,   batch_size=256, shuffle=False, num_workers=4, pin_memory=True)
 
     criterion = nn.MSELoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
 
-    resume_path = "fno_params_to_image_more_envs_30.pt"  # or None
+    resume_path = "fno_params_to_image_cameras_10.pt"  # or None
     start_epoch = 0
     num_epochs  = 150  # total epochs you want to reach
 
@@ -334,7 +333,7 @@ def main():
         if (epoch + 1) % 10 == 0:
             print(f"Epoch {epoch+1}/{num_epochs} Saved.")
             # save checkpoint
-            ckpt_path = f"fno_params_to_image_cameras_{epoch+1:03d}.pt"
+            ckpt_path = f"fno_params_to_image_cameras_larger{epoch+1:03d}.pt"
             torch.save({
                 "epoch": epoch + 1,
                 "model_state": model.state_dict(),
@@ -383,7 +382,7 @@ def main():
             print("Saved val example:", fname)
 
     # save model + normalization stats
-    out_path = "fno_params_to_image_cameras.pt"
+    out_path = "fno_params_to_image_cameras_larger.pt"
     torch.save({
         "model_state": model.state_dict(),
         "param_mean": full_dataset.param_mean,
