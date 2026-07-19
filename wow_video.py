@@ -117,7 +117,7 @@ def build_param_vec(p1, p2, sigma,
 def main():
     # ---------- Load dataset just to get normalization stats ----------
     base_dir   = Path("./plane_dataset_3")  # adjust if needed
-    image_csv  = base_dir / "renders" / "metadata_images_all.csv"
+    image_csv  = base_dir / "renders" / "metadata_images_all_combined.csv"
     volume_csv = base_dir / "metadata_volumes.csv"
 
     dataset = PlaneDatasetParamsToImageSharded(
@@ -134,7 +134,7 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = FNOPlusResNet(latent_dim=latent_dim, img_size=(64, 64)).to(device)
 
-    ckpt = torch.load("fno_params_to_image_cameras_100_finetuned.pt", map_location=device, weights_only=False)
+    ckpt = torch.load("fno_params_to_image_cameras_130_finetuned_finetuned.pt", map_location=device, weights_only=False)
     state = ckpt["model_state"]
     state.pop("_metadata", None)
     model.load_state_dict(state)

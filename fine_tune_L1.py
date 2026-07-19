@@ -19,12 +19,12 @@ def loss_fn(preds, targets):
 def main():
     # -------- paths & settings --------
     base_dir   = Path("./plane_dataset_3")
-    image_csv  = base_dir / "renders" / "metadata_images_all.csv"
+    image_csv  = base_dir / "renders" / "metadata_images_all_combined.csv"
     volume_csv = base_dir / "metadata_volumes.csv"
 
-    checkpoint_path = Path("fno_params_to_image_cameras_100.pt")  # your MSE-trained checkpoint
+    checkpoint_path = Path("fno_params_to_image_cameras_larger130_finetuned.pt")  # your MSE-trained checkpoint
     finetune_epochs = 30
-    batch_size = 16
+    batch_size = 128
     val_frac = 0.1
     lr = 1e-4   # lower LR for finetune
 
@@ -54,9 +54,9 @@ def main():
     print("N_train:", len(train_dataset), "N_val:", len(val_dataset))
 
     train_loader = DataLoader(train_dataset, batch_size=batch_size,
-                              shuffle=True, num_workers=2)
+                              shuffle=True, num_workers=4)
     val_loader   = DataLoader(val_dataset,   batch_size=batch_size,
-                              shuffle=False, num_workers=2)
+                              shuffle=False, num_workers=4)
 
     # -------- model & checkpoint load --------
     model = FNOPlusResNet(latent_dim=latent_dim, img_size=(64, 64)).to(device)
@@ -149,7 +149,7 @@ def main():
             print("Saved finetune val example:", fname)
 
     # -------- save finetuned model --------
-    out_ckpt = "fno_params_to_image_cameras_100_finetuned.pt"
+    out_ckpt = "fno_params_to_image_cameras_larger130_finetuned_finetuned.pt"
     torch.save({
         "model_state": model.state_dict(),
         "param_mean":  full_dataset.param_mean,

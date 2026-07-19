@@ -11,8 +11,10 @@
 !shape_count.py
 !pack_dataset.py
 !merge_metadata_shards.py
+!testing.py
 !submit1.slurm
 !submit2.slurm
 !submit3.slurm
 !submit4.slurm
 !submit5.slurm
+!submit6.slurm

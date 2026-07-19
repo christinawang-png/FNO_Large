@@ -272,124 +272,26 @@ def main():
     model = FNOPlusResNet(latent_dim=latent_dim, img_size=(64, 64)).to(device)
     print(f"Using device: {device}")
 
-    train_loader = DataLoader(train_dataset, batch_size=128, shuffle=True,  num_workers=8, pin_memory=True, persistent_workers=True)
-    val_loader   = DataLoader(val_dataset,   batch_size=128, shuffle=False, num_workers=8, pin_memory=True, persistent_workers=True)
-
     criterion = nn.MSELoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
 
-    resume_path = "fno_params_to_image_cameras_larger050.pt"  # or None
-    start_epoch = 50
-    num_epochs  = 150  # total epochs you want to reach
 
-    resume = True
-
-    if resume_path is not None and os.path.isfile(resume_path) and resume:
-        print("Resuming from", resume_path)
-        ckpt = torch.load(resume_path, map_location=device, weights_only=False)
-        state = ckpt["model_state"]
-        state.pop("_metadata", None)  # if needed
-        model.load_state_dict(state)
-        print("Resumed at epoch", start_epoch)
+    subset = torch.utils.data.Subset(train_dataset, range(512))
+    loader_small = DataLoader(subset, batch_size=32, shuffle=True, num_workers=0)
         
 
-    for epoch in range(start_epoch, num_epochs):
-        # ---- train ----
-        model.train()
-        total_train = 0.0
-        for param_vec, images in train_loader:
+    for epoch in range(10):
+        total = 0.0
+        for param_vec, images in loader_small:
             param_vec = param_vec.to(device)
             images = images.to(device)
-
             preds = model(param_vec)
             loss = criterion(preds, images)
-
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
-
-            total_train += loss.item() * param_vec.size(0)
-
-        avg_train = total_train / len(train_dataset)
-
-        # ---- val ----
-        model.eval()
-        total_val = 0.0
-        with torch.no_grad():
-            for param_vec, images in val_loader:
-                param_vec = param_vec.to(device)
-                images = images.to(device)
-
-                preds = model(param_vec)
-                loss = criterion(preds, images)
-                total_val += loss.item() * param_vec.size(0)
-
-        avg_val = total_val / len(val_dataset)
-
-        if (epoch + 1) % 5 == 0:
-            print(f"Epoch {epoch+1}/{num_epochs}, "
-                f"train_loss={avg_train:.6f}, val_loss={avg_val:.6f}")
-            
-        if (epoch + 1) % 10 == 0:
-            print(f"Epoch {epoch+1}/{num_epochs} Saved.")
-            # save checkpoint
-            ckpt_path = f"fno_params_to_image_cameras_larger{epoch+1:03d}.pt"
-            torch.save({
-                "epoch": epoch + 1,
-                "model_state": model.state_dict(),
-                "param_mean": full_dataset.param_mean,
-                "param_std": full_dataset.param_std,
-                "latent_dim": latent_dim,
-            }, ckpt_path)
-    # ==============================
-    # Quick qualitative check: GT vs Pred
-    # ==============================
-    model.eval()
-    out_vis_dir = Path("qualitative_preds")
-    (out_vis_dir / "train").mkdir(parents=True, exist_ok=True)
-    (out_vis_dir / "val").mkdir(parents=True, exist_ok=True)
-
-    n_show = 4
-
-    # ---- random train examples ----
-    train_indices = random.sample(range(len(train_dataset)), min(n_show, len(train_dataset)))
-    with torch.no_grad():
-        for i, idx in enumerate(train_indices):
-            param_vec, img_gt = train_dataset[idx]
-            param_vec = param_vec.unsqueeze(0).to(device)
-            img_gt    = img_gt.unsqueeze(0).to(device)
-
-            img_pred = model(param_vec).clamp(0, 1)
-
-            sbs = torch.cat([img_gt, img_pred], dim=3)
-            fname = out_vis_dir / "train" / f"train_{idx:06d}.png"
-            save_image(sbs, fname)
-            print("Saved train example:", fname)
-
-    # ---- random val examples ----
-    val_indices = random.sample(range(len(val_dataset)), min(n_show, len(val_dataset)))
-    with torch.no_grad():
-        for i, idx in enumerate(val_indices):
-            param_vec, img_gt = val_dataset[idx]
-            param_vec = param_vec.unsqueeze(0).to(device)
-            img_gt    = img_gt.unsqueeze(0).to(device)
-
-            img_pred = model(param_vec).clamp(0, 1)
-
-            sbs = torch.cat([img_gt, img_pred], dim=3)
-            fname = out_vis_dir / "val" / f"val_{idx:06d}.png"
-            save_image(sbs, fname)
-            print("Saved val example:", fname)
-
-    # save model + normalization stats
-    out_path = "fno_params_to_image_cameras_larger.pt"
-    torch.save({
-        "model_state": model.state_dict(),
-        "param_mean": full_dataset.param_mean,
-        "param_std": full_dataset.param_std,
-        "latent_dim": latent_dim,
-    }, out_path)
-    print("Saved model to", out_path)
+            total += loss.item() * param_vec.size(0)
+        print("epoch", epoch+1, "loss", total/len(subset))
 
 
 if __name__ == "__main__":
