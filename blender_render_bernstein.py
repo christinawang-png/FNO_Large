@@ -14,7 +14,7 @@ import pandas as pd
 # CONFIGURATION
 # ==============================
 PROJECT_ROOT = Path(__file__).resolve().parent
-BASE_DIR = PROJECT_ROOT / "plane_dataset_3"
+BASE_DIR = PROJECT_ROOT / "plane_dataset_4"
 
 VOLUME_METADATA_CSV = os.path.join(BASE_DIR, "metadata_volumes.csv")
 
@@ -49,7 +49,7 @@ ENV_H = 16
 ENV_W = 32
 SH_ORDER = 2
 
-IMAGES_PER_SHAPE = 500
+IMAGES_PER_SHAPE = 300
 SHARD_SIZE = 5000   # max images per shard
 
 # ==============================
@@ -451,7 +451,7 @@ def main():
             # flush full shard
             if current_shard_count == SHARD_SIZE:
                 shard_name = f"images_64x64_{job_id}_shard_{shard_base + current_shard_id:03d}.npy"
-                shard_path = BASE_DIR / shard_name
+                shard_path = Path(RENDER_DIR) / shard_name
                 np.save(shard_path, shard_array[:current_shard_count])
                 print("Saved shard:", shard_path)
 
@@ -463,10 +463,12 @@ def main():
                 current_shard_count = 0
                 rows = []
 
+        print("Finished shape ", sample_id)
+
     # save final partial shard
     if current_shard_count > 0:
         shard_name = f"images_64x64_{job_id}_shard_{shard_base + current_shard_id:03d}.npy"
-        shard_path = BASE_DIR / shard_name
+        shard_path = Path(RENDER_DIR) / shard_name
         np.save(shard_path, shard_array[:current_shard_count])
         print("Saved final shard:", shard_path)
 

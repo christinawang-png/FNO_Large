@@ -2,7 +2,7 @@ import glob
 import pandas as pd
 from pathlib import Path
 
-base_dir   = Path("/orcd/home/002/yuanxiuw/FNO_Large/plane_dataset_3")
+base_dir   = Path("/orcd/home/002/yuanxiuw/FNO_Large/plane_dataset_4")
 renders_dir= base_dir / "renders"
 
 # 1) Find only the per-shard CSVs, not the old metadata_images_all.csv
@@ -23,7 +23,7 @@ out_csv = renders_dir / "metadata_images_all_sharded.csv"
 df_all.to_csv(out_csv, index=False)
 print("Wrote merged shard metadata to:", out_csv)
 
-# load old
+""" # load old
 old_csv = renders_dir / "metadata_images_all.csv"
 df_old = pd.read_csv(old_csv)
 
@@ -40,4 +40,4 @@ df_new = df_new.reindex(columns=all_cols)
 df_combined = pd.concat([df_old, df_new], ignore_index=True)
 combined_csv = renders_dir / "metadata_images_all_combined.csv"
 df_combined.to_csv(combined_csv, index=False)
-print("Wrote combined old+new metadata to:", combined_csv)
+print("Wrote combined old+new metadata to:", combined_csv) """

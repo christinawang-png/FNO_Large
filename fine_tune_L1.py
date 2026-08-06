@@ -8,9 +8,34 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, random_split
 from torchvision.utils import save_image
+import piq
 
 # adjust this import to wherever you defined these
 from train import PlaneDatasetParamsToImageSharded, FNOPlusResNet  
+
+def color_sensitive_loss(preds, targets, alpha_luma=0.3, beta_chroma=0.7):
+    """
+    preds, targets: [B,3,H,W] in [0,1]
+    alpha_luma, beta_chroma: weights for luma vs chroma; beta > alpha
+    """
+    # Luminance
+    w = preds.new_tensor([0.299, 0.587, 0.114]).view(1,3,1,1)
+    Y_pred = (preds * w).sum(dim=1, keepdim=True)   # [B,1,H,W]
+    Y_gt   = (targets * w).sum(dim=1, keepdim=True)
+
+    # Chroma (color component)
+    C_pred = preds - Y_pred      # [B,3,H,W]
+    C_gt   = targets - Y_gt
+
+    loss_luma   = F.mse_loss(Y_pred, Y_gt)
+    loss_chroma = F.mse_loss(C_pred, C_gt)
+
+    return alpha_luma * loss_luma + beta_chroma * loss_chroma
+
+def loss_fn_color(preds, targets):
+    base = 0.5 * F.mse_loss(preds, targets) + 0.5 * F.l1_loss(preds, targets)
+    color = color_sensitive_loss(preds, targets, alpha_luma=0.3, beta_chroma=0.7)
+    return 0.3 * base + 0.7 * color
 
 def loss_fn(preds, targets):
     # mixed L1 + MSE
@@ -18,13 +43,14 @@ def loss_fn(preds, targets):
 
 def main():
     # -------- paths & settings --------
-    base_dir   = Path("./plane_dataset_3")
-    image_csv  = base_dir / "renders" / "metadata_images_all_combined.csv"
+    base_dir   = Path("./plane_dataset_4")
+    image_csv  = base_dir / "renders" / "metadata_images_all_sharded.csv"
     volume_csv = base_dir / "metadata_volumes.csv"
+    shards_dir = base_dir / "renders"
 
-    checkpoint_path = Path("fno_params_to_image_cameras_larger130_finetuned.pt")  # your MSE-trained checkpoint
+    checkpoint_path = Path("fno_params_to_image_cameras_larger120_finetuned.pt")  # your MSE-trained checkpoint
     finetune_epochs = 30
-    batch_size = 128
+    batch_size = 1024
     val_frac = 0.1
     lr = 1e-4   # lower LR for finetune
 
@@ -38,7 +64,7 @@ def main():
         img_size=(64,64),
         use_sh=True,
         normalize_params=True,
-        shards_dir=str(base_dir),  # wherever you saved images_64x64_shard_*.npy
+        shards_dir=str(shards_dir),  # wherever you saved images_64x64_shard_*.npy
     )
 
     latent_dim = full_dataset.latent_dim
@@ -149,7 +175,7 @@ def main():
             print("Saved finetune val example:", fname)
 
     # -------- save finetuned model --------
-    out_ckpt = "fno_params_to_image_cameras_larger130_finetuned_finetuned.pt"
+    out_ckpt = "fno_params_to_image_cameras_larger120_finetuned_finetuned.pt"
     torch.save({
         "model_state": model.state_dict(),
         "param_mean":  full_dataset.param_mean,

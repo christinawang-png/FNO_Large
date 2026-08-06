@@ -74,35 +74,38 @@ def sh_for_global_env(env_id_float, num_global_envs, order=2):
     rgb_scale = 0.8 * gray + 0.2 * rgb   # mostly gray with a hint of tint
     coeffs[0, :] = rgb_scale * 0.8       # brighter ambient than before
     # optional: scale all SH up a bit so env is brighter than object
-    coeffs *= 1.2
+    #coeffs *= 1.2
 
     return coeffs.astype(np.float32)  # (num_coeffs,3)
 
 
 # ---------- Build param vector in same order as PlaneDatasetParamsToImage ----------
-def build_param_vec(p1, p2, sigma,
+def build_param_vec(ctrl_vals, sigma,
                     hue, saturation, metallic, roughness, opacity, specular,
                     phi, theta, radius,
-                    sh_coeffs,  # (num_coeffs,3) or None
+                    sh_coeffs,
                     dataset):
     """
-    Matches _build_param_vector_np logic in PlaneDatasetParamsToImage.
+    ctrl_vals: list/array of control heights in the same order as ctrl_cols
+    sigma: scalar
+
+    Matches _build_param_vector_np in training:
+      [ctrl_vals..., sigma, hue, saturation, metallic, roughness, opacity, specular,
+       sin(phi), cos(phi), sin(theta), cos(theta), radius, SH...]
     """
     sin_phi, cos_phi = math.sin(phi), math.cos(phi)
-    sin_th, cos_th   = math.sin(theta), math.cos(theta)
+    sin_th,  cos_th  = math.sin(theta), math.cos(theta)
 
-    scalars = [
-        float(p1), float(p2), float(sigma),
-        float(hue), float(saturation),
-        float(metallic), float(roughness),
+    scalars = list(ctrl_vals) + [
+        float(sigma),
+        float(hue), float(saturation), float(metallic), float(roughness),
         float(opacity), float(specular),
         sin_phi, cos_phi, sin_th, cos_th,
         float(radius),
     ]
 
     if sh_coeffs is not None:
-        # Flatten SH in same order as CSV columns
-        # dataset expects columns in order sh_l.._r, sh_l.._g, sh_l.._b
+        # flatten SH in l,m,rgb order
         pairs = sh_lm_list(order=2)
         for idx, (l, m) in enumerate(pairs):
             r_c, g_c, b_c = sh_coeffs[idx]
@@ -111,13 +114,27 @@ def build_param_vec(p1, p2, sigma,
     scalars_np = np.array(scalars, dtype=np.float32)
     # normalize with training stats
     scalars_np = (scalars_np - dataset.param_mean) / dataset.param_std
-    return torch.from_numpy(scalars_np)  # [latent_dim]
+    return torch.from_numpy(scalars_np)
+
+# t in [0,1]: go cyan -> magenta -> golden -> back
+def nice_hue_path(t):
+    # piecewise: 0–1/3 cyan, 1/3–2/3 magenta, 2/3–1 gold
+    if t < 1/3:
+        h0, h1 = 0.5, 0.83      # cyan(~0.5) to magenta(~0.83)
+        u = t * 3.0
+    elif t < 2/3:
+        h0, h1 = 0.83, 0.13     # magenta to orange/gold
+        u = (t - 1/3) * 3.0
+    else:
+        h0, h1 = 0.13, 0.5      # gold back to cyan
+        u = (t - 2/3) * 3.0
+    return (1 - u) * h0 + u * h1
 
 
 def main():
     # ---------- Load dataset just to get normalization stats ----------
-    base_dir   = Path("./plane_dataset_3")  # adjust if needed
-    image_csv  = base_dir / "renders" / "metadata_images_all_combined.csv"
+    base_dir   = Path("./plane_dataset_4")  # adjust if needed
+    image_csv  = base_dir / "renders" / "metadata_images_all_sharded.csv"
     volume_csv = base_dir / "metadata_volumes.csv"
 
     dataset = PlaneDatasetParamsToImageSharded(
@@ -134,7 +151,7 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = FNOPlusResNet(latent_dim=latent_dim, img_size=(64, 64)).to(device)
 
-    ckpt = torch.load("fno_params_to_image_cameras_130_finetuned_finetuned.pt", map_location=device, weights_only=False)
+    ckpt = torch.load("fno_params_to_image_cameras_larger130_finetuned_finetuned_color.pt", map_location=device, weights_only=False)
     state = ckpt["model_state"]
     state.pop("_metadata", None)
     model.load_state_dict(state)
@@ -147,9 +164,15 @@ def main():
     num_frames = 120
     fps = 12
 
-    out_dir = Path("wow_video4_frames")
+    out_dir = Path("wow_video6_frames")
     out_dir.mkdir(parents=True, exist_ok=True)
-    video_path = Path("wow_video4.mp4")
+    video_path = Path("wow_video6.mp4")
+
+    # simple neutral env: approximate white ambient + gentle top light
+    sh_coeffs_neutral = np.zeros((9, 3), dtype=np.float32)
+    sh_coeffs_neutral[0, :] = 0.8  # strong Y_00, white-ish ambient
+    # small directional term to get some shading
+    sh_coeffs_neutral[2, :] = 0.2  # Y_10 (z-ish)
 
     with torch.no_grad(), imageio.get_writer(video_path, fps=fps) as writer:
         for i in range(num_frames):
@@ -157,47 +180,37 @@ def main():
 
             # ---- Shape (p1, p2, sigma) ----
             # Loop in (p1,p2), slight sigma wiggle. Slightly OOD at edges.
-            p1 = math.cos(2.0 * math.pi * t)
-            p2 = math.sin(2.0 * math.pi * t)
-            sigma = 0.02 + 0.14 * (0.5 * (1.0 + math.sin(2.0 * math.pi * t)))
+            p1 = 0.8 * math.cos(2.0 * math.pi * t)
+            p2 = 0.6 * math.sin(2.0 * math.pi * t)
+            sigma = 0.03 + 0.03 * (0.5 * (1.0 + math.sin(2.0 * math.pi * t)))
+            # sigma in [0.03, 0.06]
 
             # ---- Env SH (snake + slight extrapolation) ----
-            env_id_float = (NUM_GLOBAL_ENVS - 1) * (t * 1.4 - 0.2)  # goes a bit beyond [0, N-1]
-            sh_coeffs = sh_for_global_env(env_id_float, NUM_GLOBAL_ENVS, order=2)
+            # SH_ORDER=2 → 9 coeffs per channel
+            env_id_float = (NUM_GLOBAL_ENVS - 1) * t
+            env_id = int(env_id_float)
+            sh_coeffs = sh_for_global_env(env_id, NUM_GLOBAL_ENVS, order=2)
+            # make env brighter
+            sh_coeffs *= 1.5   # global gain
+
+            # make it whiter (less tinted)
+            mean_rgb = sh_coeffs.mean(axis=1, keepdims=True)  # (9,1)
+            sh_coeffs = 0.8 * mean_rgb + 0.2 * sh_coeffs      # pull toward gray/white
 
             # ---- Material ----
             # Strongly colored, darker object
-            hue        = (0.2 + 0.6 * t) % 1.0           # cycles through colors
-            saturation = 0.7                             # fairly saturated
-
-            if t < 0.25:
-                metallic = 0.0
-            elif t < 0.5:
-                metallic = 1.0
-            elif t < 0.75:
-                metallic = 0.0
-            else:
-                metallic = 1.0
-
-            # Roughness: mid-range, oscillates between slightly glossy and quite rough
-            roughness  = 0.1 + 0.8 * (0.5 * (1.0 + math.sin(4.0 * math.pi * t)))
-            # ~0.2 to ~0.7
-
-            # Opacity: keep mostly opaque for clean edges, tiny variation only
-            opacity    = 0.8 + 0.2 * math.sin(2.0 * math.pi * t + 0.5)
-            # ~0.8–1.0
-
+            # hue oscillates between warm and cool
+            hue        = 0.9
+            saturation = 0.7     # vivid, but not neon
+            metallic   = 0.0     # keep to dielectric for clean color
+            roughness  = 0.1    # semi-gloss
+            opacity    = 1.0
             specular   = 0.5
 
             # ---- Camera ----
-            theta  = 2.0 * math.pi * t          # full orbit
-            phi_center = math.pi / 2.0   # 90°, side view
-            phi_amp    = math.radians(25)  # swing ±25°
-
-            phi = phi_center + phi_amp * math.sin(2.0 * math.pi * t)
-            phi = math.radians(65)
-            radius = 1.2 + 0.3 * math.sin(2.0 * math.pi * t)
-            # radius in [1.3, 1.5] instead of [0.8, 1.2]
+            theta = 2.0 * math.pi * t           # full horizontal orbit
+            phi   = math.radians(55)            # fixed elevation
+            radius = 1.2
 
             # ---- Build param vec & predict ----
             param_vec = build_param_vec(

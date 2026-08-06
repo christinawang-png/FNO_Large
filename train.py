@@ -90,8 +90,8 @@ class FNOPlusResNet(nn.Module):
 
         # FNO backbone
         self.fno = FNO(
-            n_modes=(40, 40),
-            hidden_channels=128,
+            n_modes=(32, 32),
+            hidden_channels=96,
             in_channels=64,
             out_channels=3
         )
@@ -167,7 +167,13 @@ class PlaneDatasetParamsToImageSharded(Dataset):
 
         # ----- volume metadata -----
         df_vol = pd.read_csv(volume_csv_path).set_index("sample_id")
-        self.shape_meta = df_vol[["p1", "p2", "sigma"]].to_dict("index")
+
+        # collect all ctrl_* columns plus sigma
+        ctrl_cols = [c for c in df_vol.columns if c.startswith("ctrl_")]
+        shape_cols = ctrl_cols + ["sigma"]
+
+        self.shape_meta = df_vol[shape_cols].to_dict("index")
+        self.ctrl_cols  = ctrl_cols   # remember order for building vectors
 
         # ----- build param stats on FILTERED df_img -----
         param_list = []
@@ -195,30 +201,40 @@ class PlaneDatasetParamsToImageSharded(Dataset):
 
     def _build_param_vector_np(self, row):
         sid = int(row["sample_id"])
-        shp = self.shape_meta[sid]
-        p1 = float(shp["p1"]); p2 = float(shp["p2"]); sigma = float(shp["sigma"])
+        shp = self.shape_meta[sid]  # dict with ctrl_* and sigma
+
+        # 1) shape params: flattened control grid + sigma
+        ctrl_vals = [float(shp[c]) for c in self.ctrl_cols]   # e.g. ctrl_0_0, ctrl_0_1, ctrl_1_0, ctrl_1_1
+        sigma     = float(shp["sigma"])
+
+        # 2) material params
         hue        = float(row["hue"])
         saturation = float(row["saturation"])
         metallic   = float(row["metallic"])
         roughness  = float(row["roughness"])
         opacity    = float(row["opacity"])
         specular   = float(row["specular"])
+
+        # 3) camera params
         phi        = float(row["phi"])
         theta      = float(row["theta"])
         radius     = float(row["radius"])
         sin_phi, cos_phi = math.sin(phi), math.cos(phi)
-        sin_th, cos_th   = math.sin(theta), math.cos(theta)
+        sin_th,  cos_th  = math.sin(theta), math.cos(theta)
 
-        scalars = [
-            p1, p2, sigma,
-            hue, saturation, metallic, roughness, opacity, specular,
-            sin_phi, cos_phi, sin_th, cos_th,
-            radius,
-        ]
+        scalars = (
+            ctrl_vals
+            + [sigma]
+            + [hue, saturation, metallic, roughness, opacity, specular]
+            + [sin_phi, cos_phi, sin_th, cos_th, radius]
+        )
+
+        # 4) env SH coeffs
         if self.use_sh:
             for col in self.df_img.columns:
                 if col.startswith("sh_l") and col.endswith(("_r", "_g", "_b")):
                     scalars.append(float(row[col]))
+
         return np.array(scalars, dtype=np.float32)
 
     def __getitem__(self, idx):
@@ -240,9 +256,10 @@ def loss_fn(preds, targets):
 # ==============================
 
 def main():
-    base_dir = Path("./plane_dataset_3")
-    image_csv = base_dir / "renders" / "metadata_images_all_combined.csv"   # or shard
+    base_dir = Path("./plane_dataset_4")
+    image_csv = base_dir / "renders" / "metadata_images_all_sharded.csv"   # or shard
     volume_csv = base_dir / "metadata_volumes.csv"
+    shards_dir = base_dir / "renders"
 
     full_dataset = PlaneDatasetParamsToImageSharded(
         image_csv_path=str(image_csv),
@@ -250,7 +267,7 @@ def main():
         img_size=(64,64),
         use_sh=True,
         normalize_params=True,
-        shards_dir=str(base_dir),  # wherever you saved images_64x64_shard_*.npy
+        shards_dir=str(shards_dir),  # wherever you saved images_64x64_shard_*.npy
     )
 
     N = len(full_dataset)
@@ -272,8 +289,8 @@ def main():
     model = FNOPlusResNet(latent_dim=latent_dim, img_size=(64, 64)).to(device)
     print(f"Using device: {device}")
 
-    train_loader = DataLoader(train_dataset, batch_size=128, shuffle=True,  num_workers=8, pin_memory=True, persistent_workers=True)
-    val_loader   = DataLoader(val_dataset,   batch_size=128, shuffle=False, num_workers=8, pin_memory=True, persistent_workers=True)
+    train_loader = DataLoader(train_dataset, batch_size=512, shuffle=True,  num_workers=8, pin_memory=True, persistent_workers=True)
+    val_loader   = DataLoader(val_dataset,   batch_size=512, shuffle=False, num_workers=8, pin_memory=True, persistent_workers=True)
 
     criterion = nn.MSELoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
@@ -327,11 +344,12 @@ def main():
         avg_val = total_val / len(val_dataset)
 
         if (epoch + 1) % 5 == 0:
-            print(f"Epoch {epoch+1}/{num_epochs}, "
-                f"train_loss={avg_train:.6f}, val_loss={avg_val:.6f}")
+            print("Epoch " + str(epoch + 1) + "/" + str(num_epochs) +
+                ", train_loss=" + str(avg_train) +
+                ", val_loss=" + str(avg_val))
             
         if (epoch + 1) % 10 == 0:
-            print(f"Epoch {epoch+1}/{num_epochs} Saved.")
+            print("Epoch " + str(epoch + 1) + "/" + str(num_epochs) + " Saved.")
             # save checkpoint
             ckpt_path = f"fno_params_to_image_cameras_larger{epoch+1:03d}.pt"
             torch.save({

@@ -1,21 +1,7 @@
 #!/usr/bin/env python
-"""
-generate_bent_planes.py
-
-1. Sample a grid of (p1, p2) bending parameters.
-2. For each (p1, p2), define a scalar field V(x,y,z) via a B-spline heightfield
-   z = f(x,y).
-3. Optionally wrap that in a Gaussian (thickness controlled by sigma).
-4. Extract an isosurface using marching cubes.
-5. Save:
-   - coeffs_XXXX.npy : here we store the B-spline control grid
-   - volume_XXXX.npy : scalar field on the grid
-   - mesh_XXXX.npz   : verts, faces arrays
-   - metadata_volumes.csv describing everything (including p1, p2, sigma)
-"""
-
 import os
 import csv
+import itertools
 import numpy as np
 from skimage.measure import marching_cubes
 from pathlib import Path
@@ -26,78 +12,60 @@ from scipy.interpolate import RectBivariateSpline
 # ==============================
 
 PROJECT_ROOT = Path(__file__).resolve().parent
-
-OUTPUT_DIR = PROJECT_ROOT / "plane_dataset_3"
+OUTPUT_DIR   = PROJECT_ROOT / "plane_dataset_4"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 GRID_NX = 64
 GRID_NY = 64
 GRID_NZ = 64
 
-# Kept only for metadata compatibility
 DEG_X = 2
 DEG_Y = 2
 DEG_Z = 2
 
-# Grid of bending parameters
-NUM_P1 = 10
-NUM_P2 = 10
-P1_MIN, P1_MAX = -1.0, 1.0
-P2_MIN, P2_MAX = -1.0, 1.0
+# B-spline control grid size
+NY_CTRL = 2
+NX_CTRL = 2
 
-# Marching cubes isovalue: for Gaussian field, pick e.g. 0.5
-ISOVALUE = 0.5
+# control point height range and sampling
+CTRL_MAX          = 0.4           # larger control range
+NUM_CTRL_LEVELS   = 5              # e.g. [-0.25,-0.125,0,0.125,0.25]
+BASE_HEIGHT       = 0.5            # vertical offset
 
-COEFF_MEAN = 0.0
-COEFF_STD = 1.0
+# sigma values (thickness)
+SIGMA_VALUES_LARGE = [0.02, 0.08, 0.2, 0.5, 0.7]
 
-# Thickness parameters (Gaussian sigma)
-SIGMA_VALUES = [0.005, 0.01, 0.02, 0.04, 0.08, 0.16]
-
-# Control grid resolution for B-spline heightfield
-NY_CTRL = 4
-NX_CTRL = 4
+COEFF_MEAN  = 0.0
+COEFF_STD   = 1.0
 
 # ==============================
 # B-SPLINE HEIGHTFIELD
 # ==============================
 
-def make_bspline_heightfield(control_grid, xs, ys, kx=3, ky=3):
+def make_bspline_heightfield(control_grid, xs, ys, kx=1, ky=1):
     """
-    control_grid: (Ny_ctrl, Nx_ctrl) array of control point heights
-    xs: 1D array of x positions in [0,1], length nx
-    ys: 1D array of y positions in [0,1], length ny
-
-    Returns f_xy: (nx, ny) B-spline surface evaluated on xs, ys.
+    control_grid: (Ny_ctrl, Nx_ctrl)
+    xs: [nx] in [0,1]
+    ys: [ny] in [0,1]
+    returns f_xy: (nx, ny)
     """
     Ny_ctrl, Nx_ctrl = control_grid.shape
-
     x_ctrl = np.linspace(0.0, 1.0, Nx_ctrl)
     y_ctrl = np.linspace(0.0, 1.0, Ny_ctrl)
 
-    # RectBivariateSpline expects z[x_idx, y_idx], so we pass control_grid.T
     spline = RectBivariateSpline(x_ctrl, y_ctrl, control_grid.T, kx=kx, ky=ky)
-
-    f_xy = spline(xs, ys)  # shape (nx, ny)
+    f_xy = spline(xs, ys)  # (nx, ny)
     return f_xy
 
-
-def volume_bent_plane(p1, p2, nx, ny, nz,
-                      sigma=0.02,
-                      use_signed_dist=True):
+def volume_from_control_grid(control_grid, sigma, nx, ny, nz):
     """
-    Create a scalar field for a bent plane via a B-spline heightfield.
+    Given a control_grid (Ny_ctrl, Nx_ctrl) and sigma, build volume V(x,y,z):
 
-    If use_signed_dist=True:
-        V = d = Z - f(x,y)  (signed "distance" along z; zero-level is the surface)
-
-    If use_signed_dist=False:
-        V = density = exp(-0.5 * (d / sigma)^2)  (Gaussian "thickness" around the surface)
+        d(x,y,z)  = z - f(x,y)
+        V(x,y,z)  = exp(-0.5 * (d / sigma)^2)
 
     Returns:
-        V         : (nx, ny, nz) scalar field
-        xs, ys, zs
-        control_grid : (NY_CTRL, NX_CTRL) control point heights
+        V: (nx,ny,nz), xs, ys, zs
     """
     xs = np.linspace(0.0, 1.0, nx)
     ys = np.linspace(0.0, 1.0, ny)
@@ -105,34 +73,13 @@ def volume_bent_plane(p1, p2, nx, ny, nz,
 
     X, Y, Z = np.meshgrid(xs, ys, zs, indexing="ij")
 
-    # B-spline heightfield control grid, deterministic from (p1,p2)
-    rng = np.random.RandomState(
-        seed=int((p1 + 2.0) * 1000 + (p2 + 2.0) * 2000)
-    )
+    f_xy_2d = make_bspline_heightfield(control_grid, xs, ys)  # (nx,ny)
+    f_xy    = f_xy_2d[:, :, None]                             # (nx,ny,1)
 
-    base = 0.3
-    ctrl_amp = 0.03
-    control_grid = base + ctrl_amp * rng.randn(NY_CTRL, NX_CTRL).astype(np.float32)
-
-    # Slight global trend from p1, p2
-    control_grid += 0.05 * p1 * np.linspace(-1, 1, NX_CTRL)[None, :]
-    control_grid += 0.05 * p2 * np.linspace(-1, 1, NY_CTRL)[:, None]
-
-    # Evaluate B-spline z = f(x,y)
-    f_xy_2d = make_bspline_heightfield(control_grid, xs, ys)  # (nx, ny)
-    f_xy = f_xy_2d[:, :, None]  # broadcast along z
-
-    # Signed "distance" along z
     d = Z - f_xy
-
-    if use_signed_dist:
-        V = d
-    else:
-        sigma = float(sigma)
-        d_pos = np.maximum(d, 0.0) 
-        V = np.exp(-0.5 * (d_pos / sigma) ** 2)
-
-    return V, xs, ys, zs, control_grid
+    d_pos = np.maximum(d, 0.0)        # or np.minimum(d, 0.0) for the other side
+    V = np.exp(-0.5 * (d_pos / sigma)**2)
+    return V, xs, ys, zs
 
 # ==============================
 # MAIN
@@ -149,78 +96,91 @@ def main():
         "grid_nx", "grid_ny", "grid_nz",
         "coeff_mean", "coeff_std",
         "isovalue",
-        "p1", "p2",
         "sigma",
     ]
+    # also flatten control grid into metadata for reference
+    for j in range(NY_CTRL):
+        for i in range(NX_CTRL):
+            fieldnames.append(f"ctrl_{j}_{i}")
 
-    p1_values = np.linspace(P1_MIN, P1_MAX, NUM_P1)
-    p2_values = np.linspace(P2_MIN, P2_MAX, NUM_P2)
+    # define discrete levels for each control point
+    ctrl_levels = np.linspace(-CTRL_MAX, CTRL_MAX, NUM_CTRL_LEVELS, dtype=np.float32)
 
     with open(metadata_path, "w", newline="") as f_meta:
         writer = csv.DictWriter(f_meta, fieldnames=fieldnames)
         writer.writeheader()
 
         sample_id = 0
-        for p1 in p1_values:
-            for p2 in p2_values:
-                for sigma in SIGMA_VALUES:
-                    sample_id += 1
 
-                    V, xs, ys, zs, control_grid = volume_bent_plane(
-                        p1, p2, GRID_NX, GRID_NY, GRID_NZ,
-                        sigma=sigma,
-                        use_signed_dist=False,   # Gaussian field
-                    )
+        # iterate over all control-grid combinations
+        # each control point gets a value from ctrl_levels
+        for ctrl_values in itertools.product(ctrl_levels, repeat=NY_CTRL * NX_CTRL):
+            ctrl_array = np.array(ctrl_values, dtype=np.float32).reshape(NY_CTRL, NX_CTRL)
+            # add base height
+            control_grid = BASE_HEIGHT + ctrl_array
 
-                    verts, faces, normals, values = marching_cubes(
-                        V,
-                        level=ISOVALUE,
-                        spacing=(
-                            1.0 / GRID_NX,
-                            1.0 / GRID_NY,
-                            1.0 / GRID_NZ,
-                        ),
-                    )
+            for sigma in SIGMA_VALUES_LARGE:
+                sample_id += 1
 
-                    coeff_path = OUTPUT_DIR / f"coeffs_{sample_id:04d}.npy"
-                    vol_path   = OUTPUT_DIR / f"volume_{sample_id:04d}.npy"
-                    mesh_path  = OUTPUT_DIR / f"mesh_{sample_id:04d}.npz"
+                # 1) build volume
+                V, xs, ys, zs = volume_from_control_grid(
+                    control_grid, sigma, GRID_NX, GRID_NY, GRID_NZ
+                )
 
-                    # store B-spline control grid as coefficients
-                    np.save(coeff_path, control_grid.astype(np.float32))
-                    np.save(vol_path, V.astype(np.float32))
-                    np.savez(
-                        mesh_path,
-                        verts=verts.astype(np.float32),
-                        faces=faces.astype(np.int32),
-                    )
+                vmin = float(V.min())
+                vmax = float(V.max())
 
-                    writer.writerow({
-                        "sample_id": sample_id,
-                        "coeff_path": str(coeff_path),
-                        "volume_path": str(vol_path),
-                        "mesh_path": str(mesh_path),
-                        "deg_x": DEG_X,
-                        "deg_y": DEG_Y,
-                        "deg_z": DEG_Z,
-                        "grid_nx": GRID_NX,
-                        "grid_ny": GRID_NY,
-                        "grid_nz": GRID_NZ,
-                        "coeff_mean": COEFF_MEAN,
-                        "coeff_std": COEFF_STD,
-                        "isovalue": ISOVALUE,
-                        "p1": float(p1),
-                        "p2": float(p2),
-                        "sigma": float(sigma),
-                    })
+                if vmin == vmax:
+                    print(f"[SKIP] sample_id={sample_id+1} sigma={sigma:.3f}: constant volume V={vmin:.3e}")
+                    continue
 
-                    print(
-                        f"[{sample_id}] p1={p1:.3f}, p2={p2:.3f}, "
-                        f"sigma={sigma:.4f} saved coeffs, volume, mesh"
-                    )
+                level = vmin + 0.5 * (vmax - vmin)
+
+                verts, faces, normals, values = marching_cubes(
+                    V,
+                    level=level,
+                    spacing=(1.0 / GRID_NX, 1.0 / GRID_NY, 1.0 / GRID_NZ),
+                )
+
+                coeff_path = OUTPUT_DIR / f"coeffs_{sample_id:04d}.npy"
+                vol_path   = OUTPUT_DIR / f"volume_{sample_id:04d}.npy"
+                mesh_path  = OUTPUT_DIR / f"mesh_{sample_id:04d}.npz"
+
+                # store control grid as coefficients
+                np.save(coeff_path, control_grid.astype(np.float32))
+                np.save(vol_path, V.astype(np.float32))
+                np.savez(
+                    mesh_path,
+                    verts=verts.astype(np.float32),
+                    faces=faces.astype(np.int32),
+                )
+
+                row = {
+                    "sample_id": sample_id,
+                    "coeff_path": str(coeff_path),
+                    "volume_path": str(vol_path),
+                    "mesh_path": str(mesh_path),
+                    "deg_x": DEG_X,
+                    "deg_y": DEG_Y,
+                    "deg_z": DEG_Z,
+                    "grid_nx": GRID_NX,
+                    "grid_ny": GRID_NY,
+                    "grid_nz": GRID_NZ,
+                    "coeff_mean": COEFF_MEAN,
+                    "coeff_std": COEFF_STD,
+                    "isovalue": level,
+                    "sigma": float(sigma),
+                }
+                # flatten control grid into metadata
+                for j in range(NY_CTRL):
+                    for i in range(NX_CTRL):
+                        row[f"ctrl_{j}_{i}"] = float(control_grid[j, i])
+
+                writer.writerow(row)
+
+                print(f"[{sample_id}] sigma={sigma:.3f} saved coeffs, volume, mesh")
 
     print("Done. Data written to", OUTPUT_DIR)
-
 
 if __name__ == "__main__":
     main()

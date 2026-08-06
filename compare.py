@@ -4,21 +4,23 @@ from torchvision.utils import save_image
 import random
 
 # import model + dataset definitions
-from train import PlaneDatasetParamsToImage, FNOPlusResNet  
+from train import PlaneDatasetParamsToImageSharded, FNOPlusResNet  
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-base_dir   = Path("./plane_dataset_3")
-image_csv  = base_dir / "renders" / "metadata_images_all.csv"
+base_dir   = Path("./plane_dataset_4")
+image_csv  = base_dir / "renders" / "metadata_images_all_sharded.csv"
 volume_csv = base_dir / "metadata_volumes.csv"
+shards_dir = base_dir / "renders"
 
-full_dataset = PlaneDatasetParamsToImage(
-    image_csv_path=str(image_csv),
-    volume_csv_path=str(volume_csv),
-    img_size=(64, 64),
-    use_sh=True,
-    normalize_params=True,
-)
+full_dataset = PlaneDatasetParamsToImageSharded(
+        image_csv_path=str(image_csv),
+        volume_csv_path=str(volume_csv),
+        img_size=(64,64),
+        use_sh=True,
+        normalize_params=True,
+        shards_dir=str(shards_dir),  # wherever you saved images_64x64_shard_*.npy
+    )
 latent_dim = full_dataset.latent_dim
 
 # fixed indices for comparison (choose once)
@@ -51,5 +53,7 @@ def eval_model(ckpt_path, tag):
             print(f"[{tag}] Saved:", fname)
 
 # run for base (MSE) and finetuned models
-eval_model("fno_params_to_image_cameras_100.pt", "camera")
-#eval_model("fno_params_to_image_more_envs_120_finetuned.pt", "finetune")
+#eval_model("fno_params_to_image_cameras_larger130.pt", "mse")
+eval_model("fno_params_to_image_cameras_larger120_finetuned_finetuned.pt", "finetune_finetune120")
+eval_model("fno_params_to_image_cameras_larger120.pt", "new_model_120")
+#eval_model("fno_params_to_image_cameras_larger130_finetuned_finetuned_color.pt", "finetune_colors")
