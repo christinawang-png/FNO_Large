@@ -136,6 +136,7 @@ def main():
     base_dir   = Path("./plane_dataset_4")  # adjust if needed
     image_csv  = base_dir / "renders" / "metadata_images_all_sharded.csv"
     volume_csv = base_dir / "metadata_volumes.csv"
+    shards_dir = base_dir / "renders"
 
     dataset = PlaneDatasetParamsToImageSharded(
         image_csv_path=str(image_csv),
@@ -143,7 +144,7 @@ def main():
         img_size=(64,64),
         use_sh=True,
         normalize_params=True,
-        shards_dir=str(base_dir),  # wherever you saved images_64x64_shard_*.npy
+        shards_dir=str(shards_dir),  # wherever you saved images_64x64_shard_*.npy
     )
     latent_dim = dataset.latent_dim
 
@@ -151,7 +152,7 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = FNOPlusResNet(latent_dim=latent_dim, img_size=(64, 64)).to(device)
 
-    ckpt = torch.load("fno_params_to_image_cameras_larger130_finetuned_finetuned_color.pt", map_location=device, weights_only=False)
+    ckpt = torch.load("fno_params_to_image_cameras_larger120_finetuned_finetuned.pt", map_location=device, weights_only=False)
     state = ckpt["model_state"]
     state.pop("_metadata", None)
     model.load_state_dict(state)
@@ -162,17 +163,20 @@ def main():
     # ---------- Trajectory settings ----------
     NUM_GLOBAL_ENVS = 128  # or whatever you used in generation
     num_frames = 120
-    fps = 12
+    fps = 20
+    base_ctrl = np.zeros(4)
+    n_ctrl = 4
 
-    out_dir = Path("wow_video6_frames")
+    out_dir = Path("wow_video7_frames")
     out_dir.mkdir(parents=True, exist_ok=True)
-    video_path = Path("wow_video6.mp4")
+    video_path = Path("wow_video7.mp4")
 
     # simple neutral env: approximate white ambient + gentle top light
     sh_coeffs_neutral = np.zeros((9, 3), dtype=np.float32)
-    sh_coeffs_neutral[0, :] = 0.8  # strong Y_00, white-ish ambient
+    sh_coeffs_neutral[0, :] = 0.4  # strong Y_00, white-ish ambient
     # small directional term to get some shading
-    sh_coeffs_neutral[2, :] = 0.2  # Y_10 (z-ish)
+    sh_coeffs_neutral[2, :] = 0.6  # Y_10 (z-ish)
+    sh_coeffs_neutral[2, :] += -0.2
 
     with torch.no_grad(), imageio.get_writer(video_path, fps=fps) as writer:
         for i in range(num_frames):
@@ -180,9 +184,10 @@ def main():
 
             # ---- Shape (p1, p2, sigma) ----
             # Loop in (p1,p2), slight sigma wiggle. Slightly OOD at edges.
-            p1 = 0.8 * math.cos(2.0 * math.pi * t)
-            p2 = 0.6 * math.sin(2.0 * math.pi * t)
-            sigma = 0.03 + 0.03 * (0.5 * (1.0 + math.sin(2.0 * math.pi * t)))
+            amp = 0.3
+            ctrl_offset = amp * np.sin(2.0 * math.pi * t + np.linspace(0.0, 2.0*math.pi, n_ctrl))
+            ctrl_vals = base_ctrl + ctrl_offset
+            sigma = 0.03
             # sigma in [0.03, 0.06]
 
             # ---- Env SH (snake + slight extrapolation) ----
@@ -197,29 +202,32 @@ def main():
             mean_rgb = sh_coeffs.mean(axis=1, keepdims=True)  # (9,1)
             sh_coeffs = 0.8 * mean_rgb + 0.2 * sh_coeffs      # pull toward gray/white
 
+            #sh_coeffs = sh_coeffs_neutral
+
             # ---- Material ----
             # Strongly colored, darker object
             # hue oscillates between warm and cool
-            hue        = 0.9
-            saturation = 0.7     # vivid, but not neon
+            hue        = 0.95
+            saturation = 0.6     # vivid, but not neon
             metallic   = 0.0     # keep to dielectric for clean color
-            roughness  = 0.1    # semi-gloss
+            roughness  = 0.3    # semi-gloss
             opacity    = 1.0
             specular   = 0.5
 
             # ---- Camera ----
-            theta = 2.0 * math.pi * t           # full horizontal orbit
-            phi   = math.radians(55)            # fixed elevation
+            #theta = 2.0 * math.pi * t           # full horizontal orbit
+            theta = 0
+            phi   = math.radians(75)            # fixed elevation
             radius = 1.2
 
             # ---- Build param vec & predict ----
             param_vec = build_param_vec(
-                p1, p2, sigma,
+                ctrl_vals, sigma,
                 hue, saturation, metallic, roughness, opacity, specular,
                 phi, theta, radius,
                 sh_coeffs,
                 dataset,
-            ).unsqueeze(0).to(device)  # [1, latent_dim]
+            ).unsqueeze(0).to(device)
 
             pred = model(param_vec)[0]  # [3,H,W]
             pred = pred.clamp(0, 1)

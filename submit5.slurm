@@ -2,9 +2,9 @@
 #SBATCH --job-name=test_video
 #SBATCH --nodes=1
 #SBATCH --partition=mit_normal
-#SBATCH --cpus-per-task=4
-#SBATCH --mem=20G
-#SBATCH --time=6:00:00
+#SBATCH --cpus-per-task=1
+#SBATCH --mem=5G
+#SBATCH --time=0:05:00
 
 cd "$HOME/FNO_Large"
 
