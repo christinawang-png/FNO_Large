@@ -9,12 +9,62 @@ from PIL import Image
 import torch
 import torch.nn as nn
 from torchvision import transforms
+import torch.nn.functional as F
 
 # import your Dataset/model definitions from train.py
 from train import FNOPlusResNet  # adjust if your module name differs
 
 
 # ========= SH utilities =========
+
+def precompute_sh_weights(H, W, order=2, device="cpu"):
+    """
+    Precompute Y_lm(direction) * area_weight for each pixel in an HxW grid.
+    Returns Yw: [HW, num_coeffs] tensor on device.
+    """
+    ys = torch.linspace(0, H - 1, H, device=device)
+    xs = torch.linspace(0, W - 1, W, device=device)
+    yy, xx = torch.meshgrid(ys, xs, indexing="ij")  # [H,W]
+
+    dtheta = math.pi / H
+    dphi   = 2.0 * math.pi / W
+
+    theta = (yy + 0.5) * dtheta
+    phi   = (xx + 0.5) * dphi
+
+    sin_theta = torch.sin(theta)
+    cos_theta = torch.cos(theta)
+    cos_phi   = torch.cos(phi)
+    sin_phi   = torch.sin(phi)
+
+    vx = sin_theta * cos_phi
+    vy = sin_theta * sin_phi
+    vz = cos_theta
+
+    # real SH up to l=2, 9 coeffs
+    # constants
+    c0 = 0.28209479177387814
+    c1 = 0.4886025119029199
+    c2 = 1.0925484305920792
+    c3 = 0.31539156525252005
+    c4 = 0.5462742152960396
+
+    # Y_lm per pixel, shape [H,W,9]
+    Y = torch.empty((H, W, 9), device=device, dtype=torch.float32)
+    Y[..., 0] = c0
+    Y[..., 1] = -c1 * vy
+    Y[..., 2] =  c1 * vz
+    Y[..., 3] = -c1 * vx
+    Y[..., 4] =  c2 * vx * vy
+    Y[..., 5] = -c2 * vy * vz
+    Y[..., 6] =  c3 * (3.0 * vz * vz - 1.0)
+    Y[..., 7] = -c2 * vx * vz
+    Y[..., 8] =  c4 * (vx * vx - vy * vy)
+
+    area = sin_theta * dtheta * dphi  # [H,W]
+    Yw = (Y * area[..., None]).reshape(H * W, 9)  # [HW,9]
+
+    return Yw      # each row: Y_lm * dω for that pixel
 
 def sh_lm_list(order):
     pairs = []
@@ -82,6 +132,20 @@ def project_image_to_sh(img_np, order=2):
             coeffs += (Y[:, None] * L[None, :] * weight)
 
     return coeffs.astype(np.float32)  # (num_coeffs,3)
+
+
+def project_batch_to_sh(preds_t, Yw):
+    """
+    preds_t: [B,3,H,W] on same device as Yw
+    Yw: [HW,9] precomputed weights
+    Returns coeffs: [B, 9, 3]
+    """
+    B, C, H, W = preds_t.shape
+    assert C == 3
+    L = preds_t.reshape(B, C, H * W).permute(0, 2, 1)  # [B,HW,3]
+    # coeffs[b,q,c] = sum_h L[b,h,c] * Yw[h,q]
+    coeffs = torch.einsum("bhc,hq->bqc", L, Yw)        # [B,9,3]
+    return coeffs
 
 
 # ========= Param vector builder (matches your new generator) =========
@@ -164,56 +228,72 @@ def main():
     print("Loaded renderer from", ckpt_path)
 
     # 3) Prepare storage (option: subset if you don’t want everything)
+    SHARD_SIZE_SAMPLES = 10000  # or 100k, tune as you like
+    H = W = 64
+    Yw = precompute_sh_weights(H, W, order=2, device=device)
     N = len(df_img)
-    # if you want a subset:
-    # N = min(N, 200000)
     in_dim  = latent_dim
     sh_pairs = sh_lm_list(order=2)
-    out_dim = len(sh_pairs) * 3  # 9 coeffs * 3 channels = 27
+    out_dim = len(sh_pairs) * 3  # 27
 
-    X = np.empty((N, in_dim),  dtype=np.float32)
-    Y = np.empty((N, out_dim), dtype=np.float32)
+    out_dir = base_dir / "transport_data"
+    out_dir.mkdir(parents=True, exist_ok=True)
 
+    shard_id = 0
+    shard_count = 0
+    X_shard = np.empty((SHARD_SIZE_SAMPLES, in_dim),  dtype=np.float32)
+    Y_shard = np.empty((SHARD_SIZE_SAMPLES, out_dim), dtype=np.float32)
+
+    sample_idx = 0  # global sample counter
     batch_size = 1024
-    H = W = 64
 
     with torch.no_grad():
         for i_start in range(0, N, batch_size):
             i_end = min(N, i_start + batch_size)
             rows = df_img.iloc[i_start:i_end]
 
-            # build param vectors (unnormalized) on CPU
+            # build and normalize params_norm as before
             param_list = []
             for _, row in rows.iterrows():
                 p = build_param_vector(row, shape_meta, ctrl_cols, use_sh=True)
                 param_list.append(p)
-            params_np = np.stack(param_list, axis=0)  # [B, in_dim]
-
-            # normalize using ckpt stats
+            params_np = np.stack(param_list, axis=0)
             params_norm = (params_np - param_mean) / param_std
 
-            params_t = torch.from_numpy(params_norm).to(device)  # [B, D]
-            preds_t  = model(params_t)                            # [B,3,64,64]
-            preds_t  = preds_t.clamp(0,1)
+            params_t = torch.from_numpy(params_norm).to(device)
+            preds_t  = model(params_t).clamp(0,1)          # [B,3,64,64]
 
-            preds_np = preds_t.cpu().numpy()  # [B,3,H,W]
+            # batched SH projection on GPU
+            sh_coeffs_t = project_batch_to_sh(preds_t, Yw)  # [B,9,3]
+            sh_coeffs_np = sh_coeffs_t.cpu().numpy().reshape(-1, out_dim)  # [B,27]
 
-            # project each pred to SH
-            B = preds_np.shape[0]
+            B = sh_coeffs_np.shape[0]
             for j in range(B):
-                sh_coeffs = project_image_to_sh(preds_np[j], order=2)  # (9,3)
-                X[i_start + j] = params_norm[j]
-                Y[i_start + j] = sh_coeffs.reshape(-1)  # 27
+                X_shard[shard_count] = params_norm[j]
+                Y_shard[shard_count] = sh_coeffs_np[j]
+                shard_count += 1
+                sample_idx += 1
 
-            print(f"[{i_end}/{N}] processed")
+                # flush full shard
+                if shard_count == SHARD_SIZE_SAMPLES:
+                    X_path = out_dir / f"X_params_shard_{shard_id:03d}.npy"
+                    Y_path = out_dir / f"Y_sh_out_shard_{shard_id:03d}.npy"
+                    np.save(X_path, X_shard)
+                    np.save(Y_path, Y_shard)
+                    print(f"Saved shard {shard_id} with {shard_count} samples to", X_path, Y_path)
 
-    # 4) Save transport dataset
-    out_dir = base_dir / "transport_data"
-    out_dir.mkdir(parents=True, exist_ok=True)
+                    shard_id += 1
+                    shard_count = 0
 
-    np.save(out_dir / "X_params.npy", X)
-    np.save(out_dir / "Y_sh_out.npy", Y)
-    print("Saved X_params.npy and Y_sh_out.npy to", out_dir)
+            print(f"[{i_end}/{N}] processed, total samples so far: {sample_idx}")
+
+    # save final partial shard, if any
+    if shard_count > 0:
+        X_path = out_dir / f"X_params_shard_{shard_id:03d}.npy"
+        Y_path = out_dir / f"Y_sh_out_shard_{shard_id:03d}.npy"
+        np.save(X_path, X_shard[:shard_count])
+        np.save(Y_path, Y_shard[:shard_count])
+        print(f"Saved final shard {shard_id} with {shard_count} samples to", X_path, Y_path)
 
 
 if __name__ == "__main__":
