@@ -17,6 +17,17 @@ from train import FNOPlusResNet  # adjust if your module name differs
 
 # ========= SH utilities =========
 
+# define canonical cameras per face: (phi, theta, radius)
+RADIUS_FACE = 1.0
+FACE_CAMS = [
+    ("+X", (math.pi/2, 0.0,     RADIUS_FACE)),
+    ("-X", (math.pi/2, math.pi, RADIUS_FACE)),
+    ("+Y", (math.pi/2, math.pi/2,  RADIUS_FACE)),
+    ("-Y", (math.pi/2, 3*math.pi/2, RADIUS_FACE)),
+    ("+Z", (0.0,      0.0,     RADIUS_FACE)),
+    ("-Z", (math.pi,  0.0,     RADIUS_FACE)),
+]
+
 def precompute_sh_weights(H, W, order=2, device="cpu"):
     """
     Precompute Y_lm(direction) * area_weight for each pixel in an HxW grid.
@@ -150,14 +161,9 @@ def project_batch_to_sh(preds_t, Yw):
 
 # ========= Param vector builder (matches your new generator) =========
 
-def build_param_vector(row, shape_meta, ctrl_cols, use_sh=True):
-    """
-    row: pandas Series from metadata_images_all_combined.csv
-    shape_meta: dict sample_id -> {ctrl_*, sigma}
-    ctrl_cols: list of ctrl_* column names in sorted order
-    """
+def build_param_vector(row, shape_meta, ctrl_cols, use_sh=True, override_cam=None, face_id=None):
     sid = int(row["sample_id"])
-    shp = shape_meta[sid]
+    shp = shape_meta[sid]  # dict with ctrl_*, sigma
 
     # shape
     ctrl_vals = [float(shp[c]) for c in ctrl_cols]
@@ -171,10 +177,14 @@ def build_param_vector(row, shape_meta, ctrl_cols, use_sh=True):
     opacity    = float(row["opacity"])
     specular   = float(row["specular"])
 
-    # camera
-    phi        = float(row["phi"])
-    theta      = float(row["theta"])
-    radius     = float(row["radius"])
+    # camera: either from row or overridden
+    if override_cam is not None:
+        phi, theta, radius = override_cam
+    else:
+        phi   = float(row["phi"])
+        theta = float(row["theta"])
+        radius = float(row["radius"])
+
     sin_phi, cos_phi = math.sin(phi), math.cos(phi)
     sin_th,  cos_th  = math.sin(theta), math.cos(theta)
 
@@ -184,6 +194,10 @@ def build_param_vector(row, shape_meta, ctrl_cols, use_sh=True):
         + [hue, saturation, metallic, roughness, opacity, specular]
         + [sin_phi, cos_phi, sin_th, cos_th, radius]
     )
+
+    # optional face indicator (0..5)
+    #if face_id is not None:
+        #scalars.append(float(face_id))
 
     if use_sh:
         for col in row.index:
@@ -228,7 +242,7 @@ def main():
     print("Loaded renderer from", ckpt_path)
 
     # 3) Prepare storage (option: subset if you don’t want everything)
-    SHARD_SIZE_SAMPLES = 10000  # or 100k, tune as you like
+    SHARD_SIZE_SAMPLES = 100000 # or 100k, tune as you like
     H = W = 64
     Yw = precompute_sh_weights(H, W, order=2, device=device)
     N = len(df_img)
@@ -239,36 +253,51 @@ def main():
     out_dir = base_dir / "transport_data"
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    faces = FACE_CAMS
+    num_faces = len(faces)
+    in_dim  = latent_dim  # if you include face_id
+    out_dim = 9 * 3           # order 2 SH, RGB
+
     shard_id = 0
     shard_count = 0
     X_shard = np.empty((SHARD_SIZE_SAMPLES, in_dim),  dtype=np.float32)
     Y_shard = np.empty((SHARD_SIZE_SAMPLES, out_dim), dtype=np.float32)
 
     sample_idx = 0  # global sample counter
-    batch_size = 1024
+    batch_size = 256
 
     with torch.no_grad():
         for i_start in range(0, N, batch_size):
             i_end = min(N, i_start + batch_size)
             rows = df_img.iloc[i_start:i_end]
 
-            # build and normalize params_norm as before
+            # build per-face params for this batch: [B*num_faces, D]
             param_list = []
             for _, row in rows.iterrows():
-                p = build_param_vector(row, shape_meta, ctrl_cols, use_sh=True)
-                param_list.append(p)
-            params_np = np.stack(param_list, axis=0)
+                for face_id, (_, cam) in enumerate(faces):
+                    # cam is (phi, theta, radius)
+                    p = build_param_vector(
+                        row,
+                        shape_meta,
+                        ctrl_cols,
+                        use_sh=True,
+                        override_cam=cam,
+                        face_id=face_id
+                    )
+                    param_list.append(p)
+
+            params_np = np.stack(param_list, axis=0)    # [B*num_faces, in_dim]
             params_norm = (params_np - param_mean) / param_std
 
             params_t = torch.from_numpy(params_norm).to(device)
-            preds_t  = model(params_t).clamp(0,1)          # [B,3,64,64]
+            preds_t  = model(params_t).clamp(0,1)       # [B*num_faces,3,64,64]
 
-            # batched SH projection on GPU
-            sh_coeffs_t = project_batch_to_sh(preds_t, Yw)  # [B,9,3]
-            sh_coeffs_np = sh_coeffs_t.cpu().numpy().reshape(-1, out_dim)  # [B,27]
+            sh_coeffs_t = project_batch_to_sh(preds_t, Yw)  # [B*num_faces,9,3]
+            sh_coeffs_np = sh_coeffs_t.cpu().numpy().reshape(-1, out_dim)  # [B*num_faces,27]
 
-            B = sh_coeffs_np.shape[0]
-            for j in range(B):
+            M = sh_coeffs_np.shape[0]  # = B * num_faces
+            # store into shards: X_shard, Y_shard (as in the previous sharding code)
+            for j in range(M):
                 X_shard[shard_count] = params_norm[j]
                 Y_shard[shard_count] = sh_coeffs_np[j]
                 shard_count += 1
