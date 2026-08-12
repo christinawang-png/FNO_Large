@@ -15,6 +15,7 @@
 !blender_render_preview.py
 !eval.py
 !generate_transport_data.py
+!generate_opacity_maps.py
 !train_faces.py
 !submit1.slurm
 !submit2.slurm
