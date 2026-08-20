@@ -22,22 +22,3 @@ df_all = df_all.sort_values(
 out_csv = renders_dir / "metadata_images_all_sharded.csv"
 df_all.to_csv(out_csv, index=False)
 print("Wrote merged shard metadata to:", out_csv)
-
-""" # load old
-old_csv = renders_dir / "metadata_images_all.csv"
-df_old = pd.read_csv(old_csv)
-
-# load new
-new_csv = renders_dir / "metadata_images_all_sharded.csv"
-df_new = pd.read_csv(new_csv)
-
-# make sure columns match; if old has extra image_path, keep it
-# union of columns
-all_cols = sorted(set(df_old.columns) | set(df_new.columns))
-df_old = df_old.reindex(columns=all_cols)
-df_new = df_new.reindex(columns=all_cols)
-
-df_combined = pd.concat([df_old, df_new], ignore_index=True)
-combined_csv = renders_dir / "metadata_images_all_combined.csv"
-df_combined.to_csv(combined_csv, index=False)
-print("Wrote combined old+new metadata to:", combined_csv) """
