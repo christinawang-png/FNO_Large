@@ -5,7 +5,6 @@ from pathlib import Path
 
 import imageio.v2 as imageio
 import numpy as np
-import pandas as pd
 import torch
 
 from train_premult_single_mode import (
@@ -27,49 +26,59 @@ IMG_META_CSV = RENDERS_DIR / "metadata_images_all_sharded.csv"
 VOL_META_CSV = BASE_DIR / "metadata_volumes.csv"
 ALPHA_META_CSV = ALPHA_DIR / "metadata_alpha_all.csv"
 
-CHECKPOINT_PATH = Path("fno_premult_surface_final.pt")
+CHECKPOINT_PATH = Path("fno_premult_volume_epoch025.pt")
 
-OUTPUT_DIR = BASE_DIR / "surface_videos"
+OUTPUT_DIR = BASE_DIR / "volume_videos"
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-OUTPUT_VIDEO = OUTPUT_DIR / "surface_interpolation.mp4"
-OUTPUT_ALPHA_VIDEO = OUTPUT_DIR / "surface_interpolation_alpha.mp4"
-OUTPUT_SIDE_BY_SIDE_VIDEO = OUTPUT_DIR / "surface_interpolation_rgb_alpha_side_by_side.mp4"
+OUTPUT_RGB_VIDEO = OUTPUT_DIR / "volume_interpolation.mp4"
+OUTPUT_ALPHA_VIDEO = OUTPUT_DIR / "volume_interpolation_alpha.mp4"
+OUTPUT_SIDE_BY_SIDE_VIDEO = OUTPUT_DIR / "volume_interpolation_rgb_alpha_vertical.mp4"
 
 IMG_SIZE = (64, 64)
+
 NUM_FRAMES = 180
 FPS = 30
 
-# Select two surface examples as interpolation endpoints.
-# These are positions among the surface-only rows, not sample IDs.
-START_SURFACE_INDEX = 0
-END_SURFACE_INDEX = 8600
+# These are indices within the volume-only dataset.
+START_VOLUME_INDEX = 0
+END_VOLUME_INDEX = 1000
 
-# If True, the animation goes start -> end -> start smoothly.
-LOOP_BACK = True
+# Set these to None to use the sigma values from the endpoint rows.
+# Otherwise, explicitly override both endpoint sigmas.
+START_SIGMA = 0.02       # example: 0.02
+END_SIGMA = 0.7         # example: 0.70
 
-# Batch size used during inference.
-INFERENCE_BATCH_SIZE = 32
+# Optional endpoint opacity overrides.
+# These control the volume opacity/density input.
+START_OPACITY = 0.8
+END_OPACITY = 0.1
 
-# Background used for the RGB video.
-# Since C is premultiplied RGB, black is the most direct visualization.
-VIDEO_BACKGROUND = np.array([1.0, 1.0, 1.0], dtype=np.float32)
+# Output background used when converting premultiplied color to RGB.
+VIDEO_BACKGROUND = np.array(
+    [0.0, 0.0, 0.0],
+    dtype=np.float32,
+)
+
+# axis=0 means:
+#   RGB on top
+#   alpha on bottom
+#
+# axis=1 would place RGB and alpha side by side horizontally.
+SIDE_BY_SIDE_AXIS = 0
 
 
 # ============================================================
 # HELPERS
 # ============================================================
 
-def tensor_or_array_to_numpy(x):
+def to_numpy(x):
     if torch.is_tensor(x):
         return x.detach().cpu().numpy()
     return np.asarray(x)
 
 
 def shortest_periodic_delta(a, b, period):
-    """
-    Shortest signed angular difference from a to b.
-    """
     return (b - a + 0.5 * period) % period - 0.5 * period
 
 
@@ -78,19 +87,36 @@ def interpolate_periodic(a, b, u, period):
     return (a + u * delta) % period
 
 
-def smooth_loop_parameter(t):
+def smooth_interpolation(t):
     """
-    0 -> 1 -> 0 with zero velocity at both ends.
+    Smooth interpolation from 0 to 1 with zero velocity
+    at the beginning and end.
+    """
+    return 0.5 - 0.5 * math.cos(math.pi * t)
+
+
+def smooth_loop(t):
+    """
+    Smooth loop:
+        start -> end -> start
     """
     return 0.5 - 0.5 * math.cos(2.0 * math.pi * t)
 
 
+def get_sh_columns(dataset):
+    """
+    Match the SH column order used by the dataset's parameter builder.
+    """
+    return [
+        c for c in dataset.df.columns
+        if c.startswith("sh_l")
+        and c.endswith(("_r", "_g", "_b"))
+    ]
+
+
 def row_to_state(dataset, row, sh_cols):
     """
-    Extract a raw, interpretable parameter state from one metadata row.
-
-    This mirrors the parameter construction used by the dataset, but keeps
-    the individual fields so they can be interpolated smoothly.
+    Extract raw, interpretable parameters from one metadata row.
     """
     sample_id = int(row["sample_id"])
     shape_info = dataset.shape_meta[sample_id]
@@ -100,14 +126,18 @@ def row_to_state(dataset, row, sh_cols):
             c: float(shape_info[c])
             for c in dataset.ctrl_cols
         },
+
         "sigma": float(shape_info["sigma"]),
 
         "hue": float(row["hue"]),
         "saturation": float(row["saturation"]),
-        "metallic": float(row["metallic"]),
-        "roughness": float(row["roughness"]),
+
+        # Volume model does not physically use these.
+        "metallic": 0.0,
+        "roughness": 0.0,
+        "specular": 0.0,
+
         "opacity": float(row["opacity"]),
-        "specular": float(row.get("specular", 0.5)),
 
         "phi": float(row["phi"]),
         "theta": float(row["theta"]),
@@ -124,57 +154,56 @@ def row_to_state(dataset, row, sh_cols):
 
 def interpolate_states(a, b, u, ctrl_cols, sh_cols):
     """
-    Interpolate two raw parameter states.
-
-    Hue and theta use shortest circular interpolation.
+    Interpolate two volume parameter states.
     """
     out = {
         "ctrl": {},
         "sh": {},
     }
 
+    # Shape control points.
     for c in ctrl_cols:
         out["ctrl"][c] = (
             (1.0 - u) * a["ctrl"][c]
             + u * b["ctrl"][c]
         )
 
-    out["sigma"] = (1.0 - u) * a["sigma"] + u * b["sigma"]
+    # Explicitly interpolate sigma.
+    out["sigma"] = (
+        (1.0 - u) * a["sigma"]
+        + u * b["sigma"]
+    )
 
-    # Hue is cyclic in [0, 1].
+    # Color.
     out["hue"] = interpolate_periodic(
-        a["hue"], b["hue"], u, period=1.0
+        a["hue"],
+        b["hue"],
+        u,
+        period=1.0,
     )
 
     out["saturation"] = (
         (1.0 - u) * a["saturation"]
         + u * b["saturation"]
     )
-    out["metallic"] = (
-        (1.0 - u) * a["metallic"]
-        + u * b["metallic"]
-    )
-    out["roughness"] = (
-        (1.0 - u) * a["roughness"]
-        + u * b["roughness"]
-    )
+
+    # Volume opacity/density control.
     out["opacity"] = (
         (1.0 - u) * a["opacity"]
         + u * b["opacity"]
     )
-    out["specular"] = (
-        (1.0 - u) * a["specular"]
-        + u * b["specular"]
-    )
 
+    # Camera angles.
     out["phi"] = (
         (1.0 - u) * a["phi"]
         + u * b["phi"]
     )
 
-    # Theta is circular in [0, 2*pi].
     out["theta"] = interpolate_periodic(
-        a["theta"], b["theta"], u, period=2.0 * math.pi
+        a["theta"],
+        b["theta"],
+        u,
+        period=2.0 * math.pi,
     )
 
     out["radius"] = (
@@ -182,11 +211,17 @@ def interpolate_states(a, b, u, ctrl_cols, sh_cols):
         + u * b["radius"]
     )
 
+    # Environment SH.
     for c in sh_cols:
         out["sh"][c] = (
             (1.0 - u) * a["sh"][c]
             + u * b["sh"][c]
         )
+
+    # Keep volume-only material values zero.
+    out["metallic"] = 0.0
+    out["roughness"] = 0.0
+    out["specular"] = 0.0
 
     return out
 
@@ -199,25 +234,31 @@ def state_to_normalized_vector(
     sh_cols,
 ):
     """
-    Build the exact normalized parameter vector expected by the surface model.
+    Construct the parameter vector in exactly the same order
+    as PlaneDatasetParamsToPremultRGBA.
 
-    The final is_volume flag is always 0 because this is the surface model.
+    This is for a volume model, so:
+        metallic = 0
+        roughness = 0
+        specular = 0
+        is_volume = 1
     """
     scalars = []
 
     # Shape parameters.
     for c in dataset.ctrl_cols:
         scalars.append(state["ctrl"][c])
+
     scalars.append(state["sigma"])
 
-    # Surface material parameters.
+    # Material parameters.
     scalars.extend([
         state["hue"],
         state["saturation"],
-        state["metallic"],
-        state["roughness"],
+        0.0,                    # metallic
+        0.0,                    # roughness
         state["opacity"],
-        state["specular"],
+        0.0,                    # specular
     ])
 
     # Camera parameters.
@@ -236,47 +277,50 @@ def state_to_normalized_vector(
     for c in sh_cols:
         scalars.append(state["sh"][c])
 
-    # Surface mode indicator.
-    scalars.append(0.0)
+    # Volume indicator.
+    scalars.append(1.0)
 
     raw = np.asarray(scalars, dtype=np.float32)
 
-    if raw.shape[0] != param_mean.shape[0]:
+    if raw.shape[0] != len(param_mean):
         raise RuntimeError(
-            f"Parameter dimension mismatch: constructed {raw.shape[0]}, "
-            f"checkpoint expects {param_mean.shape[0]}"
+            f"Parameter dimension mismatch: "
+            f"constructed {raw.shape[0]}, "
+            f"expected {len(param_mean)}"
         )
 
     normalized = (raw - param_mean) / param_std
     return normalized.astype(np.float32)
 
 
-def make_model_frame(model_output, background):
+def make_rgb_frame(model_output, background):
     """
-    Convert model output [4,H,W] = premultiplied RGB + alpha
-    into an RGB uint8 video frame.
+    model_output: [4,H,W]
+        channels 0:3 = premultiplied RGB
+        channel 3   = alpha
     """
     output = np.clip(model_output, 0.0, 1.0)
 
-    C = output[:3]       # [3,H,W], premultiplied color
-    alpha = output[3:4]  # [1,H,W]
+    color = output[:3]
+    alpha = output[3:4]
+
+    bg = background.reshape(3, 1, 1)
 
     # Composite premultiplied color over background.
-    bg = background.reshape(3, 1, 1)
-    composite = C + (1.0 - alpha) * bg
+    rgb = color + (1.0 - alpha) * bg
+    rgb = np.transpose(rgb, (1, 2, 0))
+    rgb = np.clip(rgb, 0.0, 1.0)
 
-    frame = np.transpose(composite, (1, 2, 0))
-    frame = np.clip(frame, 0.0, 1.0)
-
-    return (frame * 255.0 + 0.5).astype(np.uint8)
+    return (rgb * 255.0 + 0.5).astype(np.uint8)
 
 
 def make_alpha_frame(model_output):
     """
-    Convert alpha channel to an RGB grayscale uint8 frame.
+    Convert alpha to grayscale RGB for video writing.
     """
     alpha = np.clip(model_output[3], 0.0, 1.0)
     frame = np.repeat(alpha[..., None], 3, axis=2)
+
     return (frame * 255.0 + 0.5).astype(np.uint8)
 
 
@@ -306,46 +350,40 @@ def main():
     )
 
     if "render_mode" not in dataset.df.columns:
-        raise RuntimeError("Dataset does not contain render_mode.")
+        raise RuntimeError(
+            "Dataset is missing render_mode."
+        )
 
-    surface_df = dataset.df[
-        dataset.df["render_mode"].astype(str) == "surface"
-    ].reset_index(drop=True)
+    # Keep only volume rows.
+    volume_mask = (
+        dataset.df["render_mode"].astype(str) == "volume"
+    )
+    volume_df = dataset.df[volume_mask].reset_index(drop=True)
 
-    if len(surface_df) == 0:
-        raise RuntimeError("No surface rows found.")
+    if len(volume_df) == 0:
+        raise RuntimeError("No volume rows found.")
 
-    if START_SURFACE_INDEX >= len(surface_df):
-        raise IndexError("START_SURFACE_INDEX is out of range.")
+    if START_VOLUME_INDEX >= len(volume_df):
+        raise IndexError("START_VOLUME_INDEX is out of range.")
 
-    if END_SURFACE_INDEX >= len(surface_df):
-        raise IndexError("END_SURFACE_INDEX is out of range.")
+    if END_VOLUME_INDEX >= len(volume_df):
+        raise IndexError("END_VOLUME_INDEX is out of range.")
 
-    start_row = surface_df.iloc[START_SURFACE_INDEX]
-    end_row = surface_df.iloc[END_SURFACE_INDEX]
+    start_row = volume_df.iloc[START_VOLUME_INDEX]
+    end_row = volume_df.iloc[END_VOLUME_INDEX]
 
     print(
-        "Start:",
-        START_SURFACE_INDEX,
-        "sample_id=",
+        "Start volume index:",
+        START_VOLUME_INDEX,
+        "sample_id:",
         int(start_row["sample_id"]),
     )
     print(
-        "End:",
-        END_SURFACE_INDEX,
-        "sample_id=",
+        "End volume index:",
+        END_VOLUME_INDEX,
+        "sample_id:",
         int(end_row["sample_id"]),
     )
-
-    # The SH column ordering must exactly match the training dataset.
-    sh_cols = [
-        c for c in dataset.df.columns
-        if c.startswith("sh_l")
-        and c.endswith(("_r", "_g", "_b"))
-    ]
-
-    start_state = row_to_state(dataset, start_row, sh_cols)
-    end_state = row_to_state(dataset, end_row, sh_cols)
 
     # --------------------------------------------------------
     # Load checkpoint.
@@ -358,11 +396,24 @@ def main():
         weights_only=False,
     )
 
-    checkpoint_state = checkpoint.get("model_state", checkpoint)
+    checkpoint_state = checkpoint.get(
+        "model_state",
+        checkpoint,
+    )
     checkpoint_state.pop("_metadata", None)
 
+    checkpoint_mode = checkpoint.get("mode", "unknown")
+    if checkpoint_mode != "unknown" and checkpoint_mode != "volume":
+        print(
+            f"[WARN] Checkpoint mode is {checkpoint_mode!r}, "
+            "not 'volume'."
+        )
+
     checkpoint_latent_dim = int(
-        checkpoint.get("latent_dim", dataset.latent_dim)
+        checkpoint.get(
+            "latent_dim",
+            dataset.latent_dim,
+        )
     )
 
     if checkpoint_latent_dim != dataset.latent_dim:
@@ -372,14 +423,14 @@ def main():
         )
 
     if "param_mean" in checkpoint:
-        param_mean = tensor_or_array_to_numpy(
+        param_mean = to_numpy(
             checkpoint["param_mean"]
         ).astype(np.float32)
     else:
         param_mean = dataset.param_mean.astype(np.float32)
 
     if "param_std" in checkpoint:
-        param_std = tensor_or_array_to_numpy(
+        param_std = to_numpy(
             checkpoint["param_std"]
         ).astype(np.float32)
     else:
@@ -396,10 +447,53 @@ def main():
     print("Checkpoint loaded.")
 
     # --------------------------------------------------------
-    # Prepare output writers.
+    # Build endpoint states.
     # --------------------------------------------------------
-    writer = imageio.get_writer(
-        str(OUTPUT_VIDEO),
+    sh_cols = get_sh_columns(dataset)
+
+    start_state = row_to_state(
+        dataset,
+        start_row,
+        sh_cols,
+    )
+
+    end_state = row_to_state(
+        dataset,
+        end_row,
+        sh_cols,
+    )
+
+    # Override endpoint sigmas if requested.
+    if START_SIGMA is not None:
+        start_state["sigma"] = float(START_SIGMA)
+
+    if END_SIGMA is not None:
+        end_state["sigma"] = float(END_SIGMA)
+
+    # Override endpoint opacity if requested.
+    if START_OPACITY is not None:
+        start_state["opacity"] = float(START_OPACITY)
+
+    if END_OPACITY is not None:
+        end_state["opacity"] = float(END_OPACITY)
+
+    print(
+        f"Sigma interpolation: "
+        f"{start_state['sigma']:.6f} -> "
+        f"{end_state['sigma']:.6f}"
+    )
+
+    print(
+        f"Opacity interpolation: "
+        f"{start_state['opacity']:.6f} -> "
+        f"{end_state['opacity']:.6f}"
+    )
+
+    # --------------------------------------------------------
+    # Create video writers.
+    # --------------------------------------------------------
+    rgb_writer = imageio.get_writer(
+        str(OUTPUT_RGB_VIDEO),
         fps=FPS,
         codec="libx264",
         quality=8,
@@ -411,8 +505,8 @@ def main():
         codec="libx264",
         quality=8,
     )
-    
-    side_by_side_writer = imageio.get_writer(
+
+    side_writer = imageio.get_writer(
         str(OUTPUT_SIDE_BY_SIDE_VIDEO),
         fps=FPS,
         codec="libx264",
@@ -424,11 +518,11 @@ def main():
             for frame_idx in range(NUM_FRAMES):
                 t = frame_idx / max(NUM_FRAMES - 1, 1)
 
-                if LOOP_BACK:
-                    u = smooth_loop_parameter(t)
-                else:
-                    # Smooth one-way interpolation.
-                    u = 0.5 - 0.5 * math.cos(math.pi * t)
+                # Use this for start -> end.
+                u = smooth_interpolation(t)
+
+                # For a looping animation, replace the previous line with:
+                # u = smooth_loop(t)
 
                 state = interpolate_states(
                     start_state,
@@ -450,39 +544,55 @@ def main():
                     param_np
                 ).float().unsqueeze(0).to(device)
 
-                pred = model(param_tensor)
-                pred_np = pred[0].detach().cpu().numpy()
+                prediction = model(param_tensor)
+                prediction_np = (
+                    prediction[0]
+                    .detach()
+                    .cpu()
+                    .numpy()
+                )
 
-                rgb_frame = make_model_frame(
-                    pred_np,
+                rgb_frame = make_rgb_frame(
+                    prediction_np,
                     VIDEO_BACKGROUND,
                 )
-                alpha_frame = make_alpha_frame(pred_np)
-                
-                # Horizontal layout: RGB on the left, alpha on the right
-                side_by_side_frame = np.concatenate(
-                    [rgb_frame, alpha_frame],
-                    axis=0,
+
+                alpha_frame = make_alpha_frame(
+                    prediction_np,
                 )
 
-                writer.append_data(rgb_frame)
+                if SIDE_BY_SIDE_AXIS == 0:
+                    combined_frame = np.concatenate(
+                        [rgb_frame, alpha_frame],
+                        axis=0,
+                    )
+                else:
+                    combined_frame = np.concatenate(
+                        [rgb_frame, alpha_frame],
+                        axis=1,
+                    )
+
+                rgb_writer.append_data(rgb_frame)
                 alpha_writer.append_data(alpha_frame)
-                side_by_side_writer.append_data(side_by_side_frame)
-                
+                side_writer.append_data(combined_frame)
 
                 if frame_idx % 10 == 0:
                     print(
-                        f"Rendered frame {frame_idx + 1}/{NUM_FRAMES}"
+                        f"Rendered frame "
+                        f"{frame_idx + 1}/{NUM_FRAMES}"
                     )
 
     finally:
-        writer.close()
+        rgb_writer.close()
         alpha_writer.close()
-        side_by_side_writer.close()
+        side_writer.close()
 
-    print("Saved RGB video:", OUTPUT_VIDEO)
+    print("Saved RGB video:", OUTPUT_RGB_VIDEO)
     print("Saved alpha video:", OUTPUT_ALPHA_VIDEO)
-    print("Saved side-by-side video:", OUTPUT_SIDE_BY_SIDE_VIDEO)
+    print(
+        "Saved RGB/alpha video:",
+        OUTPUT_SIDE_BY_SIDE_VIDEO,
+    )
 
 
 if __name__ == "__main__":
