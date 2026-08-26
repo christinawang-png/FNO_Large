@@ -3,3 +3,4 @@
 !*.py
 !train.ipynb
 !*.slurm
+!gaussian_splatting_copy
