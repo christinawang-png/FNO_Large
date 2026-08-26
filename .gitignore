@@ -1,6 +1,18 @@
+# Ignore everything under FNO_Large by default
 *
+
+# Keep this .gitignore file
 !.gitignore
+
+# Allow Git to traverse directories
+!*/
+
+# Keep Python and Slurm files anywhere under FNO_Large
 !*.py
-!train.ipynb
 !*.slurm
-!gaussian_splatting_copy
+
+# Keep the entire gaussian_splatting_copy directory
+!/gaussian_splatting_copy/
+!/gaussian_splatting_copy/**
+
+/gaussian_splatting_copy/*.out
