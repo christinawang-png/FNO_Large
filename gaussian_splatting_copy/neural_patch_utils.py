@@ -42,34 +42,215 @@ import torch.nn.functional as F
 
 from train_premult_single_mode import FNOPlusResNetSingle
 
+IMG_SIZE = (64, 64)
+
+def place_patch_differentiable(
+    patch,
+    canvas_height,
+    canvas_width,
+    center_x,
+    center_y,
+    patch_width,
+    patch_height,
+):
+    """
+    Differentiably resize and place an RGBA patch into a canvas.
+
+    patch:
+        Tensor with shape [B, C, H, W].
+        For the FNO output:
+            [B, 4, 64, 64]
+
+    center_x, center_y:
+        Patch center in canvas pixel coordinates.
+
+    patch_width, patch_height:
+        Desired patch size in canvas pixels.
+
+    Returns:
+        Tensor with shape [B, C, canvas_height, canvas_width].
+    """
+    if patch.ndim != 4:
+        raise ValueError(
+            f"Expected patch [B,C,H,W], got {tuple(patch.shape)}"
+        )
+
+    batch_size = patch.shape[0]
+    dtype = patch.dtype
+    device = patch.device
+
+    # Convert inputs to tensors while preserving gradients when they
+    # are already tensors requiring gradients.
+    center_x = torch.as_tensor(
+        center_x,
+        dtype=dtype,
+        device=device,
+    ).reshape(-1)
+
+    center_y = torch.as_tensor(
+        center_y,
+        dtype=dtype,
+        device=device,
+    ).reshape(-1)
+
+    patch_width = torch.as_tensor(
+        patch_width,
+        dtype=dtype,
+        device=device,
+    ).reshape(-1)
+
+    patch_height = torch.as_tensor(
+        patch_height,
+        dtype=dtype,
+        device=device,
+    ).reshape(-1)
+
+    if center_x.numel() == 1:
+        center_x = center_x.expand(batch_size)
+
+    if center_y.numel() == 1:
+        center_y = center_y.expand(batch_size)
+
+    if patch_width.numel() == 1:
+        patch_width = patch_width.expand(batch_size)
+
+    if patch_height.numel() == 1:
+        patch_height = patch_height.expand(batch_size)
+
+    patch_width = patch_width.clamp_min(2.0)
+    patch_height = patch_height.clamp_min(2.0)
+
+    canvas_w_minus_one = float(
+        max(canvas_width - 1, 1)
+    )
+
+    canvas_h_minus_one = float(
+        max(canvas_height - 1, 1)
+    )
+
+    # Convert patch center from pixel coordinates to normalized
+    # canvas coordinates.
+    center_x_norm = (
+        2.0 * center_x / canvas_w_minus_one - 1.0
+    )
+
+    center_y_norm = (
+        2.0 * center_y / canvas_h_minus_one - 1.0
+    )
+
+    # Scale from canvas-normalized coordinates to patch-normalized
+    # coordinates.
+    scale_x = canvas_w_minus_one / patch_width
+    scale_y = canvas_h_minus_one / patch_height
+
+    # Construct theta without breaking the autograd graph.
+    theta = torch.stack(
+        [
+            torch.stack(
+                [
+                    scale_x,
+                    torch.zeros_like(scale_x),
+                    -scale_x * center_x_norm,
+                ],
+                dim=1,
+            ),
+            torch.stack(
+                [
+                    torch.zeros_like(scale_y),
+                    scale_y,
+                    -scale_y * center_y_norm,
+                ],
+                dim=1,
+            ),
+        ],
+        dim=1,
+    )
+
+    grid = F.affine_grid(
+        theta,
+        size=(
+            batch_size,
+            patch.shape[1],
+            canvas_height,
+            canvas_width,
+        ),
+        align_corners=True,
+    )
+
+    canvas = F.grid_sample(
+        patch,
+        grid,
+        mode="bilinear",
+        padding_mode="zeros",
+        align_corners=True,
+    )
+
+    return canvas
+
 
 def camera_to_slice_pose(viewpoint_camera, slice_center):
     """
-    Convert a 3DGS camera position into spherical coordinates
-    relative to a neural slice center.
+    Compute the camera pose relative to a neural slice.
 
-    Returns:
-        phi
-        theta
-        actual_radius
-        relative_camera_position
+    Parameters
+    ----------
+    viewpoint_camera:
+        3DGS Camera object with camera_center.
+
+    slice_center:
+        Tensor [3] containing the slice center in world coordinates.
+
+    Returns
+    -------
+    phi:
+        Polar angle in radians.
+
+    theta:
+        Azimuth angle in radians.
+
+    actual_radius:
+        Actual camera-to-slice distance.
+
+    relative:
+        Camera position relative to the slice center.
     """
     camera_center = viewpoint_camera.camera_center
 
+    slice_center = slice_center.to(
+        device=camera_center.device,
+        dtype=camera_center.dtype,
+    )
+
     relative = camera_center - slice_center
 
-    actual_radius = torch.linalg.norm(relative).clamp_min(1e-8)
+    actual_radius = torch.linalg.norm(
+        relative
+    ).clamp_min(1e-8)
 
     x = relative[0]
     y = relative[1]
     z = relative[2]
 
     phi = torch.acos(
-        torch.clamp(z / actual_radius, -1.0, 1.0)
+        torch.clamp(
+            z / actual_radius,
+            -1.0,
+            1.0,
+        )
     )
 
     theta = torch.atan2(y, x)
-    theta = torch.remainder(theta, 2.0 * math.pi)
+    theta = torch.remainder(
+        theta,
+        2.0 * math.pi,
+    )
+
+    return (
+        phi,
+        theta,
+        actual_radius,
+        relative,
+    )
     
 def compute_scene_median_center(gaussian_model):
     """
