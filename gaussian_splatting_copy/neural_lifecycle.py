@@ -403,14 +403,21 @@ def split_top_slices(
     mode_selector=None,
 ):
     """
-    Split the highest-scoring slices.
+    Split highest-scoring parent slices.
 
-    Parent is removed and replaced by two smaller children.
+    Each selected parent is replaced by two children.
+    Every non-selected slice is preserved.
 
     Returns:
-        list of indices that were split
+        selected: list of original parent indices that were split.
     """
-    if len(neural_scene.slices) >= max_total_slices:
+    old_slices = list(neural_scene.slices)
+    num_old_slices = len(old_slices)
+
+    if num_old_slices == 0:
+        return []
+
+    if num_old_slices >= max_total_slices:
         return []
 
     scores = score_slices_for_split(
@@ -420,57 +427,96 @@ def split_top_slices(
         min_patch_size=min_patch_size,
     )
 
-    ranked = sorted(
+    ranked_indices = sorted(
         range(len(scores)),
-        key=lambda i: scores[i],
+        key=lambda index: scores[index],
         reverse=True,
+    )
+
+    # Each parent replaced by two children adds one net slice.
+    available_splits = max_total_slices - num_old_slices
+    num_to_select = min(
+        int(max_splits),
+        available_splits,
     )
 
     selected = []
 
-    available_splits = min(
-        max_splits,
-        max_total_slices - len(neural_scene.slices),
-    )
-
-    for i in ranked:
-        if len(selected) >= available_splits:
+    for index in ranked_indices:
+        if len(selected) >= num_to_select:
             break
 
-        if not math.isfinite(scores[i]):
+        score = scores[index]
+
+        if not math.isfinite(score):
             continue
 
-        if scores[i] <= 0.0:
+        if score <= 0.0:
             continue
 
-        selected.append(i)
+        selected.append(index)
 
     if not selected:
         return []
 
+    selected_set = set(selected)
+
+    print(
+        "[split_top_slices] "
+        f"old_count={num_old_slices}, "
+        f"selected={sorted(selected_set)}"
+    )
+
     new_slices = []
 
-    for i, neural_slice in enumerate(neural_scene.slices):
-        if i in selected:
-            child_a, child_b = split_slice(
-                neural_slice,
+    # IMPORTANT:
+    # This loop preserves every non-selected old slice.
+    for parent_index, parent in enumerate(old_slices):
+        if parent_index not in selected_set:
+            new_slices.append(parent)
+            continue
+
+        # Parent is selected: replace it with two children.
+        child_a, child_b = split_slice(parent)
+
+        if mode_selector is not None:
+            selected_children = mode_selector(
+                parent_index=parent_index,
+                child_a=child_a,
+                child_b=child_b,
             )
-        
-            # Optional surface/volume selection supplied by the
-            # training script. Keeps lifecycle.py renderer-independent.
-            if mode_selector is not None:
-                child_a, child_b = mode_selector(
-                    parent_index=i,
-                    child_a=child_a,
-                    child_b=child_b,
+
+            if (
+                not isinstance(selected_children, tuple)
+                or len(selected_children) != 2
+            ):
+                raise RuntimeError(
+                    "mode_selector must return "
+                    "(child_a, child_b)."
                 )
-        
-            new_slices.extend([
-                child_a,
-                child_b,
-            ])
+
+            child_a, child_b = selected_children
+
+        new_slices.append(child_a)
+        new_slices.append(child_b)
+
+    expected_count = num_old_slices + len(selected)
+
+    if len(new_slices) != expected_count:
+        raise RuntimeError(
+            "Split produced wrong number of slices: "
+            f"old={num_old_slices}, "
+            f"num_split={len(selected)}, "
+            f"expected={expected_count}, "
+            f"actual={len(new_slices)}"
+        )
 
     neural_scene.slices = nn.ModuleList(new_slices)
+
+    print(
+        "[split_top_slices] "
+        f"new_count={len(neural_scene.slices)}"
+    )
 
     return selected
 

@@ -1202,8 +1202,7 @@ def score_child_pair_modes(
 
         total_loss += image_loss(
             predicted_rgba,
-            target_rgb,
-            BACKGROUND_RGB,
+            target_rgb
         ).item()
 
     return (
