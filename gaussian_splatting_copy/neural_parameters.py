@@ -37,6 +37,7 @@ def inverse_bounded(value, low, high, eps=0.02):
 
 
 def bounded(raw, low, high):
+    raw = raw.clamp(-12.0, 12.0)
     return low + (high - low) * torch.sigmoid(raw)
 
 
@@ -260,9 +261,12 @@ class LearnableNeuralSlice(nn.Module):
 
     @property
     def world_size(self):
-        return torch.exp(
-            self.raw_world_size
-        ).clamp(0.05, 5.0)
+        safe_raw_size = self.raw_world_size.clamp(
+            min=math.log(0.05),
+            max=math.log(5.0),
+        )
+        
+        return torch.exp(safe_raw_size)
 
     @property
     def local_sh_delta(self):
@@ -303,7 +307,7 @@ class LearnableNeuralSlice(nn.Module):
         )
 
         hue = torch.remainder(
-            self.raw_hue,
+            self.raw_hue.clamp(-100.0, 100.0),
             1.0,
         )
 

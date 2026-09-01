@@ -13,6 +13,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+import random
+
 
 # ============================================================
 # PATH SETUP
@@ -44,10 +46,8 @@ from neural_lifecycle import (
     accumulate_gradient_stats,
     finalize_gradient_stats,
     collect_slice_statistics,
-    choose_prune_indices,
     prune_slices,
     split_top_slices,
-    save_neural_scene_checkpoint,
     voxel_chunk_seeds,
 )
 
@@ -86,18 +86,41 @@ SIGMA_VALUES = np.array(
 
 BACKGROUND_RGB = [1.0, 1.0, 1.0]
 
-DEFAULT_LEARNING_RATE = 1e-4
-DEFAULT_ITERATIONS = 1000
-
+# Parameter regularization.
 POSITION_REG_WEIGHT = 1e-5
 SIZE_REG_WEIGHT = 1e-3
 PARAMETER_REG_WEIGHT = 1e-5
 
-GLOBAL_SH_BOUND = 0.01
+# Lighting regularization.
+GLOBAL_SH_BOUND = 0.005
 GLOBAL_SH_REG_WEIGHT = 1e-2
 NEIGHBOR_SH_REG_WEIGHT = 1e-1
 
+# Gradient clipping.
 MAX_GRAD_NORM = 1.0
+
+# Optimization schedule.
+SHAPE_WARMUP_ITERS = 500
+LIGHTING_START_ITERS = 1000
+
+# Early stage: shape/material adapt fast.
+EARLY_PLACEMENT_LR = 1e-3
+EARLY_SHAPE_LR = 5e-3
+EARLY_MATERIAL_LR = 7e-3
+
+# Middle stage: stabilize geometry.
+MID_PLACEMENT_LR = 5e-4
+MID_SHAPE_LR = 1e-3
+MID_MATERIAL_LR = 2e-3
+
+# Final stage: mostly refine appearance/light.
+LATE_PLACEMENT_LR = 1e-4
+LATE_SHAPE_LR = 5e-4
+LATE_MATERIAL_LR = 5e-4
+
+# Lighting is deliberately very slow.
+LOCAL_SH_LR = 1e-7
+GLOBAL_SH_LR = 1e-8
 
 
 # ============================================================
@@ -143,7 +166,8 @@ def load_fno_checkpoint(checkpoint_path, device):
     model.load_state_dict(state)
     model.eval()
 
-    # Frozen model weights; gradients through input remain valid.
+    # Frozen model weights, but gradients through input vectors
+    # remain valid.
     for parameter in model.parameters():
         parameter.requires_grad_(False)
 
@@ -158,8 +182,8 @@ def load_fno_checkpoint(checkpoint_path, device):
 
 
 # ============================================================
-# PROCEDURAL SH ENVIRONMENT BANK
-# Matches the Blender render-generation script.
+# PROCEDURAL SH BANK
+# Matches Blender generation code.
 # ============================================================
 
 def sh_lm_list(order):
@@ -221,23 +245,23 @@ def sh_for_global_env(env_id, order=2):
     coeffs[0, :] = rgb_scale * 0.4
 
     for idx, (l, m) in enumerate(pairs):
-        if l == 1:
-            if m == -1:
-                coeffs[idx, :] = rgb_scale * (
-                    0.2 * math.sin(2.0 * math.pi * u)
-                )
+        if l != 1:
+            continue
 
-            elif m == 0:
-                coeffs[idx, :] = rgb_scale * (
-                    0.2 * math.cos(2.0 * math.pi * u)
+        if m == -1:
+            coeffs[idx, :] = rgb_scale * (
+                0.2 * math.sin(2.0 * math.pi * u)
+            )
+        elif m == 0:
+            coeffs[idx, :] = rgb_scale * (
+                0.2 * math.cos(2.0 * math.pi * u)
+            )
+        elif m == 1:
+            coeffs[idx, :] = rgb_scale * (
+                0.2 * math.sin(
+                    2.0 * math.pi * u + 1.0
                 )
-
-            elif m == 1:
-                coeffs[idx, :] = rgb_scale * (
-                    0.2 * math.sin(
-                        2.0 * math.pi * u + 1.0
-                    )
-                )
+            )
 
     for idx, (l, m) in enumerate(pairs):
         if l == 2 and m == 0:
@@ -257,7 +281,7 @@ def build_sh_bank(device):
             order=SH_ORDER,
         )
 
-        # [9,3] -> [27], matching training metadata ordering.
+        # [9,3] -> [27], matching training input order.
         rows.append(coeffs.reshape(-1))
 
     sh_bank = torch.tensor(
@@ -271,14 +295,10 @@ def build_sh_bank(device):
 
 
 # ============================================================
-# RANDOM INITIALIZATION PRIOR
+# RANDOM SLICE PRIOR
 # ============================================================
 
 def random_slice_init(rng, shared_sh):
-    """
-    Sample shape/material values that stay within the ranges
-    used by the FNO training data.
-    """
     return {
         "ctrl_values": rng.choice(
             CTRL_LEVELS,
@@ -312,7 +332,7 @@ def random_slice_init(rng, shared_sh):
 
         "specular": 0.5,
 
-        # All initial slices use the same scene-level environment.
+        # Initial slice SH is the scene's shared environment.
         "sh_values": shared_sh.detach().clone(),
     }
 
@@ -324,15 +344,11 @@ def make_slice_from_seed(
     device,
     optimize_sh,
 ):
-    """
-    Create one learnable slice at a voxel seed.
-    """
     if mode == "surface":
         roughness = init_params["roughness"]
         metallic = init_params["metallic"]
         specular = init_params["specular"]
     else:
-        # Must match the convention used by volume FNO training.
         roughness = 0.5
         metallic = 0.0
         specular = 0.0
@@ -358,15 +374,10 @@ def make_slice_from_seed(
 
 
 # ============================================================
-# LIGHTING / SCENE STRUCTURE
+# SHARED LIGHTING / NEURAL SCENE
 # ============================================================
 
 class SharedLighting(nn.Module):
-    """
-    Global bounded SH environment:
-
-        SH_global = SH_initial + bound * tanh(raw_delta)
-    """
     def __init__(
         self,
         initial_global_sh,
@@ -422,7 +433,7 @@ class NeuralScene(nn.Module):
 
 
 # ============================================================
-# CAMERA / PROJECTION
+# CAMERA / PROJECTION HELPERS
 # ============================================================
 
 def camera_to_slice_pose(camera, slice_center):
@@ -460,7 +471,11 @@ def camera_to_slice_pose(camera, slice_center):
     return phi, theta, actual_radius, relative
 
 
-def project_world_point(camera, point_world):
+def project_world_point(
+    camera,
+    point_world,
+    flip_projection_y=False,
+):
     matrix = camera.full_proj_transform
 
     point_world = point_world.to(
@@ -477,7 +492,7 @@ def project_world_point(camera, point_world):
         ),
     ])
 
-    # 3DGS uses row-vector convention.
+    # 3DGS matrix convention is row-vector multiplication.
     clip = point_h @ matrix
 
     ndc = clip[:3] / clip[3].clamp_min(1e-8)
@@ -488,17 +503,24 @@ def project_world_point(camera, point_world):
         * float(camera.image_width)
     )
 
-    pixel_y = (
-        (1.0 - ndc[1])
-        * 0.5
-        * float(camera.image_height)
-    )
+    if flip_projection_y:
+        pixel_y = (
+            (ndc[1] + 1.0)
+            * 0.5
+            * float(camera.image_height)
+        )
+    else:
+        pixel_y = (
+            (1.0 - ndc[1])
+            * 0.5
+            * float(camera.image_height)
+        )
 
     return pixel_x, pixel_y, ndc[2]
 
 
 # ============================================================
-# DIFFERENTIABLE UNIFORM PATCH PLACEMENT
+# BATCHED PATCH PLACEMENT
 # ============================================================
 
 def place_patch_uniform(
@@ -510,9 +532,22 @@ def place_patch_uniform(
     patch_size,
 ):
     """
-    Differentiably place patch using equal X/Y scale.
+    Inputs:
+        patch:      [B,4,64,64]
+        center_x:   [B] or scalar
+        center_y:   [B] or scalar
+        patch_size: [B] or scalar
+
+    Returns:
+        [B,4,H,W]
     """
-    batch_size = patch.shape[0]
+    if patch.ndim != 4:
+        raise ValueError(
+            f"Expected [B,C,H,W], got {tuple(patch.shape)}"
+        )
+
+    B, C, _, _ = patch.shape
+
     dtype = patch.dtype
     device = patch.device
 
@@ -535,13 +570,22 @@ def place_patch_uniform(
     ).reshape(-1)
 
     if center_x.numel() == 1:
-        center_x = center_x.expand(batch_size)
+        center_x = center_x.expand(B)
 
     if center_y.numel() == 1:
-        center_y = center_y.expand(batch_size)
+        center_y = center_y.expand(B)
 
     if patch_size.numel() == 1:
-        patch_size = patch_size.expand(batch_size)
+        patch_size = patch_size.expand(B)
+
+    if (
+        center_x.numel() != B
+        or center_y.numel() != B
+        or patch_size.numel() != B
+    ):
+        raise RuntimeError(
+            "Patch-placement batch dimensions do not match."
+        )
 
     patch_size = patch_size.clamp_min(2.0)
 
@@ -556,31 +600,40 @@ def place_patch_uniform(
         2.0 * center_y / canvas_hm1 - 1.0
     )
 
-    theta = torch.zeros(
-        batch_size,
-        2,
-        3,
-        dtype=dtype,
-        device=device,
-    )
-
     scale_x = canvas_wm1 / patch_size
     scale_y = canvas_hm1 / patch_size
 
-    theta[:, 0, 0] = scale_x
-    theta[:, 1, 1] = scale_y
+    zero = torch.zeros_like(scale_x)
 
-    theta[:, 0, 2] = -scale_x * center_x_norm
-    theta[:, 1, 2] = -scale_y * center_y_norm
+    theta_row_0 = torch.stack(
+        [
+            scale_x,
+            zero,
+            -scale_x * center_x_norm,
+        ],
+        dim=1,
+    )
+
+    theta_row_1 = torch.stack(
+        [
+            zero,
+            scale_y,
+            -scale_y * center_y_norm,
+        ],
+        dim=1,
+    )
+
+    theta = torch.stack(
+        [
+            theta_row_0,
+            theta_row_1,
+        ],
+        dim=1,
+    )
 
     grid = F.affine_grid(
         theta,
-        size=(
-            batch_size,
-            patch.shape[1],
-            canvas_height,
-            canvas_width,
-        ),
+        size=(B, C, canvas_height, canvas_width),
         align_corners=True,
     )
 
@@ -593,14 +646,45 @@ def place_patch_uniform(
     )
 
 
+def run_fno_in_chunks(
+    model,
+    params,
+    batch_size,
+):
+    """
+    params: [N,D]
+    returns: [N,4,64,64]
+    """
+    if params.shape[0] == 0:
+        raise RuntimeError("Cannot run FNO on empty batch.")
+
+    outputs = []
+
+    for start in range(
+        0,
+        params.shape[0],
+        batch_size,
+    ):
+        end = min(
+            start + batch_size,
+            params.shape[0],
+        )
+
+        outputs.append(
+            model(params[start:end])
+        )
+
+    return torch.cat(
+        outputs,
+        dim=0,
+    )
+
+
 # ============================================================
-# RENDERER
+# BATCHED NEURAL SCENE RENDERER
 # ============================================================
 
 class NeuralSceneRenderer(nn.Module):
-    """
-    Renders arbitrary number of neural slices.
-    """
     def __init__(
         self,
         surface_model,
@@ -610,6 +694,10 @@ class NeuralSceneRenderer(nn.Module):
         volume_mean,
         volume_std,
         fno_radius=FNO_RADIUS,
+        fno_batch_size=16,
+        placement_batch_size=8,
+        flip_projection_y=False,
+        flip_fno_vertical=False,
     ):
         super().__init__()
 
@@ -622,6 +710,18 @@ class NeuralSceneRenderer(nn.Module):
         self.volume_std = volume_std
 
         self.fno_radius = float(fno_radius)
+        self.fno_batch_size = int(fno_batch_size)
+        self.placement_batch_size = int(
+            placement_batch_size
+        )
+
+        self.flip_projection_y = bool(
+            flip_projection_y
+        )
+
+        self.flip_fno_vertical = bool(
+            flip_fno_vertical
+        )
 
         for model in [
             self.surface_model,
@@ -642,12 +742,14 @@ class NeuralSceneRenderer(nn.Module):
 
         out_color = (
             front_color
-            + (1.0 - front_alpha) * back_color
+            + (1.0 - front_alpha)
+            * back_color
         )
 
         out_alpha = (
             front_alpha
-            + (1.0 - front_alpha) * back_alpha
+            + (1.0 - front_alpha)
+            * back_alpha
         )
 
         return torch.cat(
@@ -655,154 +757,400 @@ class NeuralSceneRenderer(nn.Module):
             dim=1,
         )
 
-    def render_slice(
-        self,
-        camera,
-        neural_slice,
-        shared_sh,
-    ):
-        device = camera.camera_center.device
+    @staticmethod
+    def composite_layers_far_to_near(layers):
+        """
+        layers:
+            [B,4,H,W]
 
-        phi, theta, actual_radius, relative = \
-            camera_to_slice_pose(
-                camera,
-                neural_slice.center,
+        layers[0] is farthest and layers[-1] is nearest.
+        """
+        if layers.ndim != 4 or layers.shape[1] != 4:
+            raise ValueError(
+                f"Expected [B,4,H,W], got {tuple(layers.shape)}"
             )
 
-        if neural_slice.mode == "surface":
-            model = self.surface_model
-            param_mean = self.surface_mean
-            param_std = self.surface_std
-        else:
-            model = self.volume_model
-            param_mean = self.volume_mean
-            param_std = self.volume_std
+        color = layers[:, :3]
+        alpha = layers[:, 3:4]
 
-        param_vec = build_tensor_fno_vector(
-            neural_slice=neural_slice,
-            param_mean=param_mean,
-            param_std=param_std,
-            phi=phi,
-            theta=theta,
-            fno_radius=self.fno_radius,
-            device=device,
-            shared_sh=shared_sh,
+        transmittance = 1.0 - alpha
+
+        reversed_trans = transmittance.flip(0)
+
+        cumulative = torch.cumprod(
+            reversed_trans,
+            dim=0,
         )
 
-        patch = model(param_vec).clamp(0.0, 1.0)
-
-        center_x, center_y, center_depth = \
-            project_world_point(
-                camera,
-                neural_slice.center,
-            )
-
-        patch_size = (
-            float(camera.image_height)
-            * neural_slice.world_size
-            * self.fno_radius
-            / actual_radius
+        shifted = torch.cat(
+            [
+                torch.ones_like(cumulative[:1]),
+                cumulative[:-1],
+            ],
+            dim=0,
         )
 
-        layer = place_patch_uniform(
-            patch=patch,
-            canvas_height=int(camera.image_height),
-            canvas_width=int(camera.image_width),
-            center_x=center_x,
-            center_y=center_y,
-            patch_size=patch_size,
+        weight = shifted.flip(0)
+
+        output_color = torch.sum(
+            color * weight,
+            dim=0,
+            keepdim=True,
         )
 
-        info = {
-            "phi": phi,
-            "theta": theta,
-            "actual_radius": actual_radius,
-            "center_depth": center_depth,
-            "center_x": center_x,
-            "center_y": center_y,
-            "patch_size": patch_size,
-            "relative": relative,
-        }
+        output_alpha = 1.0 - torch.prod(
+            transmittance,
+            dim=0,
+            keepdim=True,
+        )
 
-        return layer.clamp(0.0, 1.0), info
-        
-    def render_slice_list(
+        return torch.cat(
+            [output_color, output_alpha],
+            dim=1,
+        )
+
+    def render_slice_list_batched(
         self,
         camera,
         slices,
         shared_sh,
+        placement_batch_size=None,
+        collect_diagnostics=False,
     ):
+        
+        active_slices = [
+            s for s in slices
+            if is_slice_potentially_visible(
+                camera=camera,
+                neural_slice=s,
+                fno_radius=self.fno_radius,
+                margin_px=64.0,
+                min_patch_size_px=2.0,
+            )
+        ]
+        
+        if len(active_slices) == 0:
+            H = int(camera.image_height)
+            W = int(camera.image_width)
+        
+            return (
+                torch.zeros(
+                    1, 4, H, W,
+                    device=camera.camera_center.device,
+                    dtype=torch.float32,
+                ),
+                [],
+            )
+        
+        slices = active_slices
         """
-        Render an explicit list of slices without mutating the live
-        NeuralScene ModuleList.
-    
-        `slices` is an ordinary Python list or ModuleList.
+        Batched rendering path.
+
+        Per camera:
+            - build all slice records
+            - run surface FNO in chunks
+            - run volume FNO in chunks
+            - place patches in chunks
+            - GPU sort far-to-near
+            - composite
         """
         if len(slices) == 0:
             raise RuntimeError("No slices to render.")
-    
-        rendered = []
-    
+
+        if placement_batch_size is None:
+            placement_batch_size = (
+                self.placement_batch_size
+            )
+
+        device = camera.camera_center.device
+
+        canvas_h = int(camera.image_height)
+        canvas_w = int(camera.image_width)
+
+        records = []
+
+        # ----------------------------------------------------
+        # Phase A: build per-slice tensor records.
+        # ----------------------------------------------------
         for slice_index, neural_slice in enumerate(slices):
-            layer, info = self.render_slice(
-                camera=camera,
+            phi, theta, actual_radius, relative = (
+                camera_to_slice_pose(
+                    camera,
+                    neural_slice.center,
+                )
+            )
+
+            if neural_slice.mode == "surface":
+                param_mean = self.surface_mean
+                param_std = self.surface_std
+            elif neural_slice.mode == "volume":
+                param_mean = self.volume_mean
+                param_std = self.volume_std
+            else:
+                raise ValueError(
+                    f"Unknown mode: {neural_slice.mode}"
+                )
+
+            param_vec = build_tensor_fno_vector(
                 neural_slice=neural_slice,
+                param_mean=param_mean,
+                param_std=param_std,
+                phi=phi,
+                theta=theta,
+                fno_radius=self.fno_radius,
+                device=device,
                 shared_sh=shared_sh,
             )
-    
-            rendered.append(
+
+            center_x, center_y, center_depth = (
+                project_world_point(
+                    camera,
+                    neural_slice.center,
+                    flip_projection_y=self.flip_projection_y,
+                )
+            )
+
+            patch_size = (
+                float(canvas_h)
+                * neural_slice.world_size
+                * self.fno_radius
+                / actual_radius
+            )
+
+            records.append(
                 {
                     "slice_index": slice_index,
-                    "layer": layer,
-                    "info": info,
-                    "depth": float(
-                        info["actual_radius"]
-                        .detach()
-                        .cpu()
-                        .item()
-                    ),
+                    "mode": neural_slice.mode,
+                    "param_vec": param_vec,
+                    "center_x": center_x,
+                    "center_y": center_y,
+                    "patch_size": patch_size,
+                    "actual_radius": actual_radius,
+                    "center_depth": center_depth,
+                    "phi": phi,
+                    "theta": theta,
+                    "relative": relative,
                 }
             )
-    
-        # Far -> near. Near slices are composited last.
-        rendered.sort(
-            key=lambda x: x["depth"],
-            reverse=True,
-        )
-    
-        composite = torch.zeros_like(
-            rendered[0]["layer"]
-        )
-    
-        diagnostics = []
-    
-        for item in rendered:
-            composite = self.alpha_over(
-                back=composite,
-                front=item["layer"],
+
+        surface_indices = [
+            i
+            for i, r in enumerate(records)
+            if r["mode"] == "surface"
+        ]
+
+        volume_indices = [
+            i
+            for i, r in enumerate(records)
+            if r["mode"] == "volume"
+        ]
+
+        num_slices = len(records)
+        patches_by_index = [None] * num_slices
+
+        # ----------------------------------------------------
+        # Phase B: batched FNO calls by mode.
+        # ----------------------------------------------------
+        if surface_indices:
+            surface_params = torch.cat(
+                [
+                    records[i]["param_vec"]
+                    for i in surface_indices
+                ],
+                dim=0,
             )
-    
-            info = dict(item["info"])
-            info["slice_index"] = item["slice_index"]
-            info["sort_depth"] = item["depth"]
-            diagnostics.append(info)
-    
+
+            surface_patches = run_fno_in_chunks(
+                self.surface_model,
+                surface_params,
+                batch_size=self.fno_batch_size,
+            )
+
+            if self.flip_fno_vertical:
+                surface_patches = torch.flip(
+                    surface_patches,
+                    dims=[2],
+                )
+
+            for local_i, record_i in enumerate(
+                surface_indices
+            ):
+                patches_by_index[record_i] = (
+                    surface_patches[
+                        local_i:local_i + 1
+                    ]
+                )
+
+        if volume_indices:
+            volume_params = torch.cat(
+                [
+                    records[i]["param_vec"]
+                    for i in volume_indices
+                ],
+                dim=0,
+            )
+
+            volume_patches = run_fno_in_chunks(
+                self.volume_model,
+                volume_params,
+                batch_size=self.fno_batch_size,
+            )
+
+            if self.flip_fno_vertical:
+                volume_patches = torch.flip(
+                    volume_patches,
+                    dims=[2],
+                )
+
+            for local_i, record_i in enumerate(
+                volume_indices
+            ):
+                patches_by_index[record_i] = (
+                    volume_patches[
+                        local_i:local_i + 1
+                    ]
+                )
+
+        if any(
+            patch is None
+            for patch in patches_by_index
+        ):
+            raise RuntimeError(
+                "At least one slice did not receive an FNO patch."
+            )
+
+        all_patches = torch.cat(
+            patches_by_index,
+            dim=0,
+        )
+
+        center_x = torch.stack(
+            [
+                r["center_x"]
+                for r in records
+            ],
+            dim=0,
+        )
+
+        center_y = torch.stack(
+            [
+                r["center_y"]
+                for r in records
+            ],
+            dim=0,
+        )
+
+        patch_sizes = torch.stack(
+            [
+                r["patch_size"]
+                for r in records
+            ],
+            dim=0,
+        )
+
+        depths = torch.stack(
+            [
+                r["actual_radius"]
+                for r in records
+            ],
+            dim=0,
+        )
+
+        # Far -> near on GPU.
+        sort_indices = torch.argsort(
+            depths.detach(),
+            descending=True,
+        )
+
+        sorted_patches = all_patches[sort_indices]
+        sorted_center_x = center_x[sort_indices]
+        sorted_center_y = center_y[sort_indices]
+        sorted_patch_sizes = patch_sizes[sort_indices]
+
+        # ----------------------------------------------------
+        # Phase C: chunked full-canvas placement.
+        # ----------------------------------------------------
+        composite = None
+
+        for start in range(
+            0,
+            num_slices,
+            placement_batch_size,
+        ):
+            end = min(
+                start + placement_batch_size,
+                num_slices,
+            )
+
+            chunk_layers = place_patch_uniform(
+                patch=sorted_patches[start:end],
+                canvas_height=canvas_h,
+                canvas_width=canvas_w,
+                center_x=sorted_center_x[start:end],
+                center_y=sorted_center_y[start:end],
+                patch_size=sorted_patch_sizes[start:end],
+            )
+
+            chunk_composite = (
+                self.composite_layers_far_to_near(
+                    chunk_layers
+                )
+            )
+
+            if composite is None:
+                composite = chunk_composite
+            else:
+                # Current chunk is nearer than prior chunks.
+                composite = self.alpha_over(
+                    back=composite,
+                    front=chunk_composite,
+                )
+
+        diagnostics = []
+
+        if collect_diagnostics:
+            order_cpu = sort_indices.detach().cpu().tolist()
+
+            for record_index in order_cpu:
+                r = records[record_index]
+
+                diagnostics.append(
+                    {
+                        "slice_index": r["slice_index"],
+                        "mode": r["mode"],
+                        "phi": r["phi"],
+                        "theta": r["theta"],
+                        "actual_radius": r["actual_radius"],
+                        "relative": r["relative"],
+                        "center_x": r["center_x"],
+                        "center_y": r["center_y"],
+                        "center_depth": r["center_depth"],
+                        "patch_size": r["patch_size"],
+                    }
+                )
+
         return composite.clamp(0.0, 1.0), diagnostics
 
-    def forward(self, camera, neural_scene):
-        return self.render_slice_list(
+    def forward(
+        self,
+        camera,
+        neural_scene,
+    ):
+        return self.render_slice_list_batched(
             camera=camera,
             slices=neural_scene.slices,
             shared_sh=neural_scene.global_sh,
+            placement_batch_size=self.placement_batch_size,
+            collect_diagnostics=False,
         )
 
 
 # ============================================================
-# LOSSES / REGULARIZATION
+# LOSS / REGULARIZATION
 # ============================================================
 
 def visible_rgb_from_rgba(rgba):
-    bg = torch.tensor(
+    background = torch.tensor(
         BACKGROUND_RGB,
         dtype=rgba.dtype,
         device=rgba.device,
@@ -810,7 +1158,7 @@ def visible_rgb_from_rgba(rgba):
 
     return rgba[:, :3] + (
         1.0 - rgba[:, 3:4]
-    ) * bg
+    ) * background
 
 
 def image_loss(predicted_rgba, target_rgb):
@@ -843,7 +1191,8 @@ def parameter_regularization(neural_scene):
 
         size_loss = (
             (
-                s.world_size - s.initial_world_size
+                s.world_size
+                - s.initial_world_size
             )
             / s.initial_world_size.clamp_min(1e-4)
         ) ** 2
@@ -866,7 +1215,8 @@ def parameter_regularization(neural_scene):
         ) ** 2
 
         appearance_loss = appearance_loss + (
-            values["opacity"] - s.initial_opacity
+            values["opacity"]
+            - s.initial_opacity
         ) ** 2
 
         if s.mode == "surface":
@@ -893,28 +1243,30 @@ def build_knn_neighbors(neural_scene, k=3):
     if len(neural_scene.slices) <= 1:
         return []
 
-    centers = torch.stack([
-        s.center.detach()
-        for s in neural_scene.slices
-    ], dim=0)
-
-    distances = torch.cdist(
-        centers,
-        centers,
+    centers = torch.stack(
+        [
+            s.center.detach()
+            for s in neural_scene.slices
+        ],
+        dim=0,
     )
 
+    distances = torch.cdist(centers, centers)
     distances.fill_diagonal_(float("inf"))
 
     pairs = set()
 
     for i in range(len(neural_scene.slices)):
-        neighbors = torch.topk(
+        indices = torch.topk(
             distances[i],
-            k=min(k, len(neural_scene.slices) - 1),
+            k=min(
+                k,
+                len(neural_scene.slices) - 1,
+            ),
             largest=False,
         ).indices.tolist()
 
-        for j in neighbors:
+        for j in indices:
             pairs.add(tuple(sorted((i, j))))
 
     return sorted(pairs)
@@ -962,18 +1314,35 @@ def global_sh_regularization(neural_scene):
 
 
 # ============================================================
-# OPTIMIZER
+# OPTIMIZATION SCHEDULE
 # ============================================================
+
+def get_optimization_stage(
+    iteration,
+    optimize_sh,
+):
+    if iteration < SHAPE_WARMUP_ITERS:
+        return "early"
+
+    if (
+        iteration < LIGHTING_START_ITERS
+        or not optimize_sh
+    ):
+        return "mid"
+
+    return "lighting"
+
 
 def make_optimizer(
     neural_scene,
-    base_lr,
+    stage,
     optimize_sh,
 ):
     placement_params = []
     shape_params = []
     material_params = []
-    lighting_params = []
+    local_sh_params = []
+    global_sh_params = []
 
     for s in neural_scene.slices:
         placement_params.extend([
@@ -994,35 +1363,69 @@ def make_optimizer(
         ])
 
         if optimize_sh:
-            lighting_params.append(
+            local_sh_params.append(
                 s.raw_local_sh_delta
             )
 
     if optimize_sh:
-        lighting_params.append(
+        global_sh_params.append(
             neural_scene.lighting.raw_global_sh_delta
+        )
+
+    if stage == "early":
+        placement_lr = EARLY_PLACEMENT_LR
+        shape_lr = EARLY_SHAPE_LR
+        material_lr = EARLY_MATERIAL_LR
+        local_sh_lr = 0.0
+        global_sh_lr = 0.0
+
+    elif stage == "mid":
+        placement_lr = MID_PLACEMENT_LR
+        shape_lr = MID_SHAPE_LR
+        material_lr = MID_MATERIAL_LR
+        local_sh_lr = 0.0
+        global_sh_lr = 0.0
+
+    elif stage == "lighting":
+        placement_lr = LATE_PLACEMENT_LR
+        shape_lr = LATE_SHAPE_LR
+        material_lr = LATE_MATERIAL_LR
+        local_sh_lr = LOCAL_SH_LR
+        global_sh_lr = GLOBAL_SH_LR
+
+    else:
+        raise ValueError(
+            f"Unknown optimizer stage: {stage}"
         )
 
     groups = [
         {
             "params": placement_params,
-            "lr": base_lr,
+            "lr": placement_lr,
         },
         {
             "params": shape_params,
-            "lr": base_lr * 2.0,
+            "lr": shape_lr,
         },
         {
             "params": material_params,
-            "lr": base_lr * 3.0,
+            "lr": material_lr,
         },
     ]
 
-    if lighting_params:
+    if optimize_sh and local_sh_lr > 0:
         groups.append(
             {
-                "params": lighting_params,
-                "lr": base_lr * 0.001,
+                "params": local_sh_params,
+                "lr": local_sh_lr,
+            }
+        )
+
+    if optimize_sh and global_sh_lr > 0:
+        groups.append(
+            {
+                "params": global_sh_params,
+                "lr": global_sh_lr,
             }
         )
 
@@ -1030,7 +1433,7 @@ def make_optimizer(
 
 
 # ============================================================
-# INITIAL SURFACE/VOLUME CANDIDATE SELECTION
+# MODE CANDIDATE SELECTION
 # ============================================================
 
 @torch.no_grad()
@@ -1039,7 +1442,7 @@ def evaluate_scene_loss(
     neural_scene,
     cameras,
 ):
-    total_loss = 0.0
+    total = 0.0
 
     for camera in cameras:
         predicted_rgba, _ = renderer(
@@ -1057,12 +1460,12 @@ def evaluate_scene_loss(
             dtype=predicted_rgba.dtype,
         )
 
-        total_loss += image_loss(
+        total += image_loss(
             predicted_rgba,
             target,
         ).item()
 
-    return total_loss / max(len(cameras), 1)
+    return total / max(len(cameras), 1)
 
 
 @torch.no_grad()
@@ -1075,23 +1478,15 @@ def choose_initial_slice_mode(
     cameras,
     device,
 ):
-    """
-    Greedy candidate selection:
-      selected existing slices + current candidate
-      → evaluate surface candidate vs volume candidate.
-    """
     surface_candidate = copy.deepcopy(
         base_candidate
     )
-
     surface_candidate.mode = "surface"
 
     volume_candidate = copy.deepcopy(
         base_candidate
     )
-
     volume_candidate.mode = "volume"
-
     volume_candidate.metallic_value.fill_(0.0)
     volume_candidate.specular_value.fill_(0.0)
 
@@ -1127,19 +1522,17 @@ def choose_initial_slice_mode(
         chosen_mode = "volume"
 
     print(
-        f"  candidate: "
+        f"  initial candidate: "
         f"surface={surface_score:.6f}, "
         f"volume={volume_score:.6f}, "
         f"chosen={chosen_mode}"
     )
 
     return chosen
-    
+
+
 @torch.no_grad()
 def set_slice_mode(neural_slice, mode):
-    """
-    Return a copied slice configured as surface or volume.
-    """
     candidate = copy.deepcopy(neural_slice)
     candidate.mode = mode
 
@@ -1161,9 +1554,6 @@ def score_child_pair_modes(
     mode_b,
     cameras,
 ):
-    """
-    Score a proposed child-mode pair without mutating the real scene.
-    """
     candidate_a = set_slice_mode(
         child_a,
         mode_a,
@@ -1174,43 +1564,47 @@ def score_child_pair_modes(
         mode_b,
     )
 
-    # Keep every old slice except the parent, then insert children.
     temporary_slices = (
         list(neural_scene.slices[:parent_index])
         + [candidate_a, candidate_b]
         + list(neural_scene.slices[parent_index + 1:])
     )
 
-    total_loss = 0.0
+    total = 0.0
 
     for camera in cameras:
-        predicted_rgba, _ = renderer.render_slice_list(
-            camera=camera,
-            slices=temporary_slices,
-            shared_sh=neural_scene.global_sh,
+        predicted_rgba, _ = (
+            renderer.render_slice_list_batched(
+                camera=camera,
+                slices=temporary_slices,
+                shared_sh=neural_scene.global_sh,
+                placement_batch_size=(
+                    renderer.placement_batch_size
+                ),
+                collect_diagnostics=False,
+            )
         )
 
-        target_rgb = camera.original_image
+        target = camera.original_image
 
-        if target_rgb.ndim == 3:
-            target_rgb = target_rgb.unsqueeze(0)
+        if target.ndim == 3:
+            target = target.unsqueeze(0)
 
-        target_rgb = target_rgb.to(
+        target = target.to(
             device=predicted_rgba.device,
             dtype=predicted_rgba.dtype,
         )
 
-        total_loss += image_loss(
+        total += image_loss(
             predicted_rgba,
-            target_rgb
+            target,
         ).item()
 
     return (
-        total_loss / max(len(cameras), 1),
+        total / max(len(cameras), 1),
         candidate_a,
         candidate_b,
     )
-    return score, candidate_a, candidate_b
 
 
 @torch.no_grad()
@@ -1234,15 +1628,17 @@ def choose_split_child_modes(
     best_modes = None
 
     for mode_a, mode_b in combinations:
-        score, candidate_a, candidate_b = score_child_pair_modes(
-            renderer=renderer,
-            neural_scene=neural_scene,
-            parent_index=parent_index,
-            child_a=child_a,
-            child_b=child_b,
-            mode_a=mode_a,
-            mode_b=mode_b,
-            cameras=cameras,
+        score, candidate_a, candidate_b = (
+            score_child_pair_modes(
+                renderer=renderer,
+                neural_scene=neural_scene,
+                parent_index=parent_index,
+                child_a=child_a,
+                child_b=child_b,
+                mode_a=mode_a,
+                mode_b=mode_b,
+                cameras=cameras,
+            )
         )
 
         print(
@@ -1260,7 +1656,8 @@ def choose_split_child_modes(
             )
 
     print(
-        f"  selected child modes for parent={parent_index}: "
+        f"  selected child modes "
+        f"for parent={parent_index}: "
         f"{best_modes}, loss={best_score:.6f}"
     )
 
@@ -1268,19 +1665,463 @@ def choose_split_child_modes(
 
 
 # ============================================================
-# SAVING
+# CONTRIBUTION PRUNING
+# ============================================================
+
+@torch.no_grad()
+def mean_scene_loss(
+    renderer,
+    neural_scene,
+    cameras,
+):
+    total = 0.0
+
+    for camera in cameras:
+        prediction, _ = (
+            renderer.render_slice_list_batched(
+                camera=camera,
+                slices=list(neural_scene.slices),
+                shared_sh=neural_scene.global_sh,
+                placement_batch_size=(
+                    renderer.placement_batch_size
+                ),
+                collect_diagnostics=False,
+            )
+        )
+
+        target = camera.original_image
+
+        if target.ndim == 3:
+            target = target.unsqueeze(0)
+
+        target = target.to(
+            device=prediction.device,
+            dtype=prediction.dtype,
+        )
+
+        total += image_loss(
+            prediction,
+            target,
+        ).item()
+
+    return total / max(len(cameras), 1)
+
+
+@torch.no_grad()
+def slice_removal_contribution(
+    renderer,
+    neural_scene,
+    remove_index,
+    cameras,
+    full_loss,
+):
+    remaining = [
+        s
+        for i, s in enumerate(neural_scene.slices)
+        if i != remove_index
+    ]
+
+    if len(remaining) == 0:
+        return float("inf"), float("inf")
+
+    total = 0.0
+
+    for camera in cameras:
+        prediction, _ = (
+            renderer.render_slice_list_batched(
+                camera=camera,
+                slices=remaining,
+                shared_sh=neural_scene.global_sh,
+                placement_batch_size=(
+                    renderer.placement_batch_size
+                ),
+                collect_diagnostics=False,
+            )
+        )
+
+        target = camera.original_image
+
+        if target.ndim == 3:
+            target = target.unsqueeze(0)
+
+        target = target.to(
+            device=prediction.device,
+            dtype=prediction.dtype,
+        )
+
+        total += image_loss(
+            prediction,
+            target,
+        ).item()
+
+    loss_without = total / max(len(cameras), 1)
+    contribution = loss_without - full_loss
+
+    return contribution, loss_without
+
+
+@torch.no_grad()
+def choose_contribution_prune_indices(
+    renderer,
+    neural_scene,
+    cameras,
+    slice_stats,
+    max_candidates=4,
+    max_prunes=2,
+    contribution_threshold=1e-4,
+):
+    if len(neural_scene.slices) <= 1:
+        return []
+
+    weak_order = sorted(
+        range(len(slice_stats)),
+        key=lambda i: (
+            slice_stats[i]["mean_alpha_mass"],
+            slice_stats[i]["max_alpha"],
+            slice_stats[i]["visible_views"],
+        ),
+    )
+
+    candidate_indices = weak_order[
+        :min(max_candidates, len(weak_order))
+    ]
+
+    full_loss = mean_scene_loss(
+        renderer=renderer,
+        neural_scene=neural_scene,
+        cameras=cameras,
+    )
+
+    print(
+        f"[CONTRIBUTION PRUNE] "
+        f"full_loss={full_loss:.8f}"
+    )
+
+    prune_indices = []
+
+    for slice_index in candidate_indices:
+        contribution, loss_without = (
+            slice_removal_contribution(
+                renderer=renderer,
+                neural_scene=neural_scene,
+                remove_index=slice_index,
+                cameras=cameras,
+                full_loss=full_loss,
+            )
+        )
+
+        print(
+            f"  slice={slice_index:02d} "
+            f"loss_without={loss_without:.8f} "
+            f"contribution={contribution:.8e}"
+        )
+
+        if contribution <= contribution_threshold:
+            prune_indices.append(slice_index)
+
+    max_allowed = min(
+        max_prunes,
+        len(neural_scene.slices) - 1,
+    )
+
+    return prune_indices[:max_allowed]
+
+
+# ============================================================
+# CHECKPOINTING / RESUME
+# ============================================================
+
+def serialize_slice(slice_obj):
+    """
+    Store constructor metadata. State dict later restores
+    exact learnable parameters and buffers.
+    """
+    return {
+        "mode": slice_obj.mode,
+        "optimize_environment": bool(
+            slice_obj.optimize_environment
+        ),
+        "local_sh_bound": float(
+            slice_obj.local_sh_bound
+        ),
+    }
+
+
+def save_neural_scene_checkpoint(
+    path,
+    neural_scene,
+    optimizer,
+    iteration,
+    metadata=None,
+):
+    path = Path(path)
+    path.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    torch.save(
+        {
+            "iteration": int(iteration),
+            "scene_state": neural_scene.state_dict(),
+            "optimizer_state": optimizer.state_dict(),
+            "slice_specs": [
+                serialize_slice(s)
+                for s in neural_scene.slices
+            ],
+            "initial_global_sh": (
+                neural_scene.lighting.initial_global_sh
+                .detach()
+                .cpu()
+            ),
+            "metadata": metadata or {},
+        },
+        path,
+    )
+
+
+def rebuild_neural_scene_from_checkpoint(
+    checkpoint,
+    device,
+    optimize_sh,
+):
+    """
+    Recreate the correct number/type of slices, then load
+    saved state including raw parameters and buffers.
+    """
+    slices = []
+
+    scene_state = checkpoint["scene_state"]
+
+    for i, spec in enumerate(
+        checkpoint["slice_specs"]
+    ):
+        prefix = f"slices.{i}."
+
+        initial_center = scene_state[
+            prefix + "initial_center"
+        ]
+
+        initial_world_size = scene_state[
+            prefix + "initial_world_size"
+        ]
+
+        initial_ctrl = scene_state[
+            prefix + "initial_ctrl"
+        ]
+
+        initial_sigma = scene_state[
+            prefix + "initial_sigma"
+        ]
+
+        initial_hue = scene_state[
+            prefix + "initial_hue"
+        ]
+
+        initial_saturation = scene_state[
+            prefix + "initial_saturation"
+        ]
+
+        initial_opacity = scene_state[
+            prefix + "initial_opacity"
+        ]
+
+        initial_roughness = scene_state[
+            prefix + "initial_roughness"
+        ]
+
+        initial_sh = scene_state[
+            prefix + "initial_sh"
+        ]
+
+        metallic_value = scene_state[
+            prefix + "metallic_value"
+        ]
+
+        specular_value = scene_state[
+            prefix + "specular_value"
+        ]
+
+        slice_obj = LearnableNeuralSlice(
+            mode=spec["mode"],
+            center=initial_center,
+            world_size=float(initial_world_size),
+            ctrl_values=initial_ctrl,
+            sigma=float(initial_sigma),
+            hue=float(initial_hue),
+            saturation=float(initial_saturation),
+            opacity=float(initial_opacity),
+            roughness=float(initial_roughness),
+            sh_values=initial_sh,
+            metallic=float(metallic_value),
+            specular=float(specular_value),
+            optimize_environment=(
+                bool(spec["optimize_environment"])
+                and optimize_sh
+            ),
+            local_sh_bound=float(
+                spec["local_sh_bound"]
+            ),
+        ).to(device)
+
+        slices.append(slice_obj)
+
+    neural_scene = NeuralScene(
+        slices=slices,
+        initial_global_sh=checkpoint[
+            "initial_global_sh"
+        ].to(device),
+        optimize_sh=optimize_sh,
+    ).to(device)
+
+    neural_scene.load_state_dict(
+        checkpoint["scene_state"]
+    )
+
+    return neural_scene
+
+
+# ============================================================
+# PREVIEW SAVING
+# ============================================================
+
+@torch.no_grad()
+def save_checkpoint_previews(
+    renderer,
+    neural_scene,
+    cameras,
+    output_dir,
+    iteration,
+    max_views=3,
+):
+    preview_dir = (
+        Path(output_dir)
+        / "previews"
+        / f"iter_{iteration:06d}"
+    )
+
+    preview_dir.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    for view_idx, camera in enumerate(
+        cameras[:max_views]
+    ):
+        predicted_rgba, _ = renderer(
+            camera,
+            neural_scene,
+        )
+
+        predicted_rgba = predicted_rgba.clamp(
+            0.0,
+            1.0,
+        )
+
+        visible_rgb = visible_rgb_from_rgba(
+            predicted_rgba
+        )[0]
+
+        target_rgb = camera.original_image.detach()
+
+        pred_np = visible_rgb.detach().cpu().numpy()
+        target_np = target_rgb.detach().cpu().numpy()
+        alpha_np = (
+            predicted_rgba[0, 3]
+            .detach()
+            .cpu()
+            .numpy()
+        )
+
+        pred_hwc = np.transpose(
+            pred_np,
+            (1, 2, 0),
+        )
+
+        target_hwc = np.transpose(
+            target_np,
+            (1, 2, 0),
+        )
+
+        alpha_rgb = np.repeat(
+            alpha_np[..., None],
+            3,
+            axis=2,
+        )
+
+        imageio.imwrite(
+            preview_dir / (
+                f"view_{view_idx:02d}_prediction.png"
+            ),
+            (
+                np.clip(pred_hwc, 0.0, 1.0)
+                * 255.0
+                + 0.5
+            ).astype(np.uint8),
+        )
+
+        imageio.imwrite(
+            preview_dir / (
+                f"view_{view_idx:02d}_alpha.png"
+            ),
+            (
+                np.clip(alpha_rgb, 0.0, 1.0)
+                * 255.0
+                + 0.5
+            ).astype(np.uint8),
+        )
+
+        imageio.imwrite(
+            preview_dir / (
+                f"view_{view_idx:02d}_target.png"
+            ),
+            (
+                np.clip(target_hwc, 0.0, 1.0)
+                * 255.0
+                + 0.5
+            ).astype(np.uint8),
+        )
+
+        comparison = np.concatenate(
+            [
+                np.clip(target_hwc, 0.0, 1.0),
+                np.clip(pred_hwc, 0.0, 1.0),
+            ],
+            axis=1,
+        )
+
+        imageio.imwrite(
+            preview_dir / (
+                f"view_{view_idx:02d}_comparison.png"
+            ),
+            (
+                comparison * 255.0 + 0.5
+            ).astype(np.uint8),
+        )
+
+    print("Saved previews:", preview_dir)
+
+
+# ============================================================
+# SMALL IMAGE SAVERS
 # ============================================================
 
 def save_rgb_chw(rgb_chw, path):
     if torch.is_tensor(rgb_chw):
         rgb_chw = rgb_chw.detach().cpu().numpy()
 
-    rgb_hwc = np.transpose(rgb_chw, (1, 2, 0))
-    rgb_hwc = np.clip(rgb_hwc, 0.0, 1.0)
+    rgb_hwc = np.transpose(
+        rgb_chw,
+        (1, 2, 0),
+    )
 
     imageio.imwrite(
         path,
-        (rgb_hwc * 255.0 + 0.5).astype(np.uint8),
+        (
+            np.clip(rgb_hwc, 0.0, 1.0)
+            * 255.0
+            + 0.5
+        ).astype(np.uint8),
     )
 
 
@@ -1288,20 +2129,24 @@ def save_rgba_chw(rgba_chw, path):
     if torch.is_tensor(rgba_chw):
         rgba_chw = rgba_chw.detach().cpu().numpy()
 
-    rgba_hwc = np.transpose(rgba_chw, (1, 2, 0))
-    rgba_hwc = np.clip(rgba_hwc, 0.0, 1.0)
+    rgba_hwc = np.transpose(
+        rgba_chw,
+        (1, 2, 0),
+    )
 
     imageio.imwrite(
         path,
-        (rgba_hwc * 255.0 + 0.5).astype(np.uint8),
+        (
+            np.clip(rgba_hwc, 0.0, 1.0)
+            * 255.0
+            + 0.5
+        ).astype(np.uint8),
     )
 
 
 def save_alpha_hw(alpha_hw, path):
     if torch.is_tensor(alpha_hw):
         alpha_hw = alpha_hw.detach().cpu().numpy()
-
-    alpha_hw = np.clip(alpha_hw, 0.0, 1.0)
 
     alpha_rgb = np.repeat(
         alpha_hw[..., None],
@@ -1311,39 +2156,61 @@ def save_alpha_hw(alpha_hw, path):
 
     imageio.imwrite(
         path,
-        (alpha_rgb * 255.0 + 0.5).astype(np.uint8),
+        (
+            np.clip(alpha_rgb, 0.0, 1.0)
+            * 255.0
+            + 0.5
+        ).astype(np.uint8),
     )
+    
 
-
-def save_comparison(
-    predicted_rgba,
-    target_rgb,
-    path,
+def is_slice_potentially_visible(
+    camera,
+    neural_slice,
+    fno_radius,
+    margin_px=64.0,
+    min_patch_size_px=2.0,
 ):
-    visible_rgb = visible_rgb_from_rgba(
-        predicted_rgba
-    )[0]
+    """
+    Fast differentiable-ish visibility screening.
+    Returns a Python bool for render culling.
 
-    if target_rgb.ndim == 4:
-        target_rgb = target_rgb[0]
-
-    pred_np = visible_rgb.detach().cpu().numpy()
-    target_np = target_rgb.detach().cpu().numpy()
-
-    pred_hwc = np.transpose(pred_np, (1, 2, 0))
-    target_hwc = np.transpose(target_np, (1, 2, 0))
-
-    comparison = np.concatenate(
-        [
-            np.clip(target_hwc, 0.0, 1.0),
-            np.clip(pred_hwc, 0.0, 1.0),
-        ],
-        axis=1,
+    This is intentionally discrete; do not use it for gradient-based
+    position optimization near image boundaries.
+    """
+    center_x, center_y, depth = project_world_point(
+        camera,
+        neural_slice.center,
+        flip_projection_y=False,
     )
 
-    imageio.imwrite(
-        path,
-        (comparison * 255.0 + 0.5).astype(np.uint8),
+    relative = camera.camera_center - neural_slice.center
+    radius = torch.linalg.norm(relative).clamp_min(1e-8)
+
+    patch_size = (
+        float(camera.image_height)
+        * neural_slice.world_size
+        * float(fno_radius)
+        / radius
+    )
+
+    # Convert only these small scalar decisions to Python.
+    x = float(center_x.detach().cpu())
+    y = float(center_y.detach().cpu())
+    z = float(depth.detach().cpu())
+    size = float(patch_size.detach().cpu())
+
+    H = float(camera.image_height)
+    W = float(camera.image_width)
+
+    # Outside screen with margin, behind camera, or too tiny.
+    return (
+        z > 0.0
+        and size >= min_patch_size_px
+        and x >= -margin_px
+        and x <= W + margin_px
+        and y >= -margin_px
+        and y <= H + margin_px
     )
 
 
@@ -1352,13 +2219,23 @@ def save_comparison(
 # ============================================================
 
 def main():
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+
+    try:
+        torch.set_float32_matmul_precision("high")
+    except AttributeError:
+        pass
+
     parser = ArgumentParser(
         description=(
-            "Dataset-free neural scene optimization using "
-            "random training-range slice priors."
+            "Dataset-free neural scene optimization with "
+            "batched FNO rendering."
         )
     )
 
+    # Adds standard 3DGS arguments:
+    # --source_path, --model_path, --resolution, etc.
     lp = ModelParams(parser)
 
     parser.add_argument(
@@ -1376,25 +2253,14 @@ def main():
     parser.add_argument(
         "--iterations",
         type=int,
-        default=DEFAULT_ITERATIONS,
-    )
-
-    parser.add_argument(
-        "--lr",
-        type=float,
-        default=DEFAULT_LEARNING_RATE,
+        default=2000,
+        help="Final total iteration count.",
     )
 
     parser.add_argument(
         "--seed",
         type=int,
         default=42,
-    )
-
-    parser.add_argument(
-        "--initial_num_slices",
-        type=int,
-        default=8,
     )
 
     parser.add_argument(
@@ -1410,23 +2276,49 @@ def main():
     )
 
     parser.add_argument(
-        "--mode_selection_cameras",
+        "--max_initial_slices",
         type=int,
-        default=3,
+        default=0,
         help=(
-            "Small camera subset used for initial "
-            "surface/volume candidate selection."
+            "Maximum voxel seeds. Use 0 for every valid voxel."
         ),
     )
 
     parser.add_argument(
         "--disable_initial_mode_selection",
         action="store_true",
+        help=(
+            "Skip expensive initial surface/volume selection. "
+            "Initial modes are randomized."
+        ),
+    )
+
+    parser.add_argument(
+        "--mode_selection_cameras",
+        type=int,
+        default=3,
+    )
+
+    parser.add_argument(
+        "--disable_child_mode_selection",
+        action="store_true",
+    )
+
+    parser.add_argument(
+        "--child_selection_cameras",
+        type=int,
+        default=3,
     )
 
     parser.add_argument(
         "--optimize_sh",
         action="store_true",
+    )
+
+    parser.add_argument(
+        "--global_sh_warmup_iterations",
+        type=int,
+        default=1000,
     )
 
     parser.add_argument(
@@ -1450,7 +2342,7 @@ def main():
     parser.add_argument(
         "--max_slices",
         type=int,
-        default=32,
+        default=128,
     )
 
     parser.add_argument(
@@ -1460,9 +2352,67 @@ def main():
     )
 
     parser.add_argument(
+        "--contribution_prune_candidates",
+        type=int,
+        default=4,
+    )
+
+    parser.add_argument(
+        "--max_prunes_per_update",
+        type=int,
+        default=2,
+    )
+
+    parser.add_argument(
+        "--contribution_threshold",
+        type=float,
+        default=1e-4,
+    )
+
+    parser.add_argument(
+        "--prune_selection_cameras",
+        type=int,
+        default=3,
+    )
+
+    parser.add_argument(
+        "--fno_batch_size",
+        type=int,
+        default=16,
+    )
+
+    parser.add_argument(
+        "--placement_batch_size",
+        type=int,
+        default=4,
+    )
+
+    parser.add_argument(
         "--checkpoint_interval",
         type=int,
         default=500,
+    )
+
+    parser.add_argument(
+        "--preview_views",
+        type=int,
+        default=2,
+    )
+
+    parser.add_argument(
+        "--resume_checkpoint",
+        type=str,
+        default=None,
+    )
+
+    parser.add_argument(
+        "--flip_projection_y",
+        action="store_true",
+    )
+
+    parser.add_argument(
+        "--flip_fno_vertical",
+        action="store_true",
     )
 
     parser.add_argument(
@@ -1500,48 +2450,51 @@ def main():
     print("Using device:", device)
     print("Random seed:", args.seed)
     print("Optimize SH:", args.optimize_sh)
+    print("FNO batch size:", args.fno_batch_size)
+    print(
+        "Placement batch size:",
+        args.placement_batch_size,
+    )
 
     # --------------------------------------------------------
-    # Load FNO models and their normalization only.
+    # Frozen FNO models / normalization.
     # --------------------------------------------------------
-    surface_model, surface_mean, surface_std, surface_dim = \
+    surface_model, surface_mean, surface_std, surface_dim = (
         load_fno_checkpoint(
             args.surface_checkpoint,
             device,
         )
+    )
 
-    volume_model, volume_mean, volume_std, volume_dim = \
+    volume_model, volume_mean, volume_std, volume_dim = (
         load_fno_checkpoint(
             args.volume_checkpoint,
             device,
         )
+    )
 
     if surface_dim != 44 or volume_dim != 44:
         raise RuntimeError(
-            f"Expected latent_dim=44; got "
+            f"Expected latent_dim=44, got "
             f"surface={surface_dim}, volume={volume_dim}"
         )
 
-    # --------------------------------------------------------
-    # Build valid environment SH bank and select one global env.
-    # --------------------------------------------------------
-    sh_bank = build_sh_bank(device)
-
-    initial_env_id = int(
-        rng.integers(0, NUM_GLOBAL_ENVS)
-    )
-
-    initial_global_sh = sh_bank[
-        initial_env_id
-    ].detach().clone()
-
-    print(
-        "Initial environment ID:",
-        initial_env_id,
-    )
+    renderer = NeuralSceneRenderer(
+        surface_model=surface_model,
+        volume_model=volume_model,
+        surface_mean=surface_mean,
+        surface_std=surface_std,
+        volume_mean=volume_mean,
+        volume_std=volume_std,
+        fno_radius=FNO_RADIUS,
+        fno_batch_size=args.fno_batch_size,
+        placement_batch_size=args.placement_batch_size,
+        flip_projection_y=args.flip_projection_y,
+        flip_fno_vertical=args.flip_fno_vertical,
+    ).to(device)
 
     # --------------------------------------------------------
-    # Load 3DGS scene.
+    # Load 3DGS scene / camera list / point cloud.
     # --------------------------------------------------------
     scene_args = lp.extract(args)
 
@@ -1581,7 +2534,7 @@ def main():
         args.camera_start:camera_end
     ]
 
-    if not cameras_used:
+    if len(cameras_used) == 0:
         raise RuntimeError("No cameras selected.")
 
     print(
@@ -1602,56 +2555,194 @@ def main():
         scene_center.detach().cpu().numpy(),
     )
 
-    # --------------------------------------------------------
-    # Renderer must exist before candidate selection.
-    # --------------------------------------------------------
-    renderer = NeuralSceneRenderer(
-        surface_model=surface_model,
-        volume_model=volume_model,
-        surface_mean=surface_mean,
-        surface_std=surface_std,
-        volume_mean=volume_mean,
-        volume_std=volume_std,
-        fno_radius=FNO_RADIUS,
-    ).to(device)
+    sh_bank = build_sh_bank(device)
 
     # --------------------------------------------------------
-    # Voxel seeds.
+    # Initialize or resume neural scene.
     # --------------------------------------------------------
-    seeds = voxel_chunk_seeds(
-        xyz=xyz,
-        voxel_size=args.voxel_size,
-        min_points=args.min_points_per_voxel,
-        max_chunks=args.initial_num_slices,
-    )
+    start_iteration = 0
 
-    if not seeds:
-        raise RuntimeError(
-            "No valid voxel seeds. Try larger voxel size "
-            "or lower min_points_per_voxel."
+    if args.resume_checkpoint is not None:
+        print("Resuming from:", args.resume_checkpoint)
+
+        checkpoint = torch.load(
+            args.resume_checkpoint,
+            map_location=device,
+            weights_only=False,
         )
 
-    print(
-        f"Voxel initialization created {len(seeds)} seeds."
+        neural_scene = rebuild_neural_scene_from_checkpoint(
+            checkpoint=checkpoint,
+            device=device,
+            optimize_sh=args.optimize_sh,
+        )
+
+        start_iteration = (
+            int(checkpoint["iteration"]) + 1
+        )
+
+        initial_env_id = checkpoint[
+            "metadata"
+        ].get("initial_env_id", -1)
+
+    else:
+        initial_env_id = int(
+            rng.integers(0, NUM_GLOBAL_ENVS)
+        )
+
+        initial_global_sh = sh_bank[
+            initial_env_id
+        ].detach().clone()
+
+        max_chunks = (
+            None
+            if args.max_initial_slices <= 0
+            else args.max_initial_slices
+        )
+
+        seeds = voxel_chunk_seeds(
+            xyz=xyz,
+            voxel_size=args.voxel_size,
+            min_points=args.min_points_per_voxel,
+            max_chunks=max_chunks,
+        )
+
+        if len(seeds) == 0:
+            raise RuntimeError(
+                "No valid voxel seeds. Increase voxel size "
+                "or lower min-points-per-voxel."
+            )
+
+        print(
+            "Voxel initialization produced",
+            len(seeds),
+            "seeds.",
+        )
+
+        mode_selection_cameras = cameras_used[
+            :min(
+                args.mode_selection_cameras,
+                len(cameras_used),
+            )
+        ]
+
+        slices = []
+
+        for i, seed in enumerate(seeds):
+            init_params = random_slice_init(
+                rng,
+                initial_global_sh,
+            )
+
+            base_candidate = make_slice_from_seed(
+                seed=seed,
+                mode="surface",
+                init_params=init_params,
+                device=device,
+                optimize_sh=args.optimize_sh,
+            )
+
+            if args.disable_initial_mode_selection:
+                chosen_mode = random.choice(
+                    ["surface", "volume"]
+                )
+
+                chosen = copy.deepcopy(
+                    base_candidate
+                )
+
+                chosen.mode = chosen_mode
+
+                if chosen_mode == "volume":
+                    chosen.metallic_value.fill_(0.0)
+                    chosen.specular_value.fill_(0.0)
+
+            else:
+                chosen = choose_initial_slice_mode(
+                    renderer=renderer,
+                    selected_slices=slices,
+                    base_candidate=base_candidate,
+                    initial_global_sh=initial_global_sh,
+                    optimize_sh=args.optimize_sh,
+                    cameras=mode_selection_cameras,
+                    device=device,
+                )
+
+                chosen_mode = chosen.mode
+
+            slices.append(chosen)
+
+            if i < 20 or i % 50 == 0:
+                print(
+                    f"seed={i:03d} "
+                    f"points={seed['num_points']} "
+                    f"size={seed['world_size']:.3f} "
+                    f"mode={chosen_mode}"
+                )
+
+        neural_scene = NeuralScene(
+            slices=slices,
+            initial_global_sh=initial_global_sh,
+            optimize_sh=args.optimize_sh,
+        ).to(device)
+
+    current_stage = get_optimization_stage(
+        iteration=start_iteration,
+        optimize_sh=args.optimize_sh,
     )
 
-    # --------------------------------------------------------
-    # Initial surface/volume mode selection.
-    # --------------------------------------------------------
-    selection_cameras = cameras_used[
+    # Global SH stays frozen until lighting stage.
+    if args.optimize_sh:
+        enable_global_sh = (
+            start_iteration
+            >= args.global_sh_warmup_iterations
+            and current_stage == "lighting"
+        )
+
+        neural_scene.lighting.raw_global_sh_delta.requires_grad_(
+            enable_global_sh
+        )
+
+    optimizer = make_optimizer(
+        neural_scene=neural_scene,
+        stage=current_stage,
+        optimize_sh=args.optimize_sh,
+    )
+
+    # Restore optimizer state only after topology is rebuilt.
+    if args.resume_checkpoint is not None:
+        try:
+            optimizer.load_state_dict(
+                checkpoint["optimizer_state"]
+            )
+            print("Restored optimizer state.")
+        except Exception as exc:
+            print(
+                "[WARN] Could not restore optimizer state:",
+                exc,
+            )
+
+    print(
+        f"[SCHEDULE] Starting stage: {current_stage}"
+    )
+
+    child_selection_cameras = cameras_used[
         :min(
-            args.mode_selection_cameras,
+            args.child_selection_cameras,
             len(cameras_used),
         )
     ]
-    
-    # Keep candidate selection cheap.
-    # Two or three cameras is enough for an initial decision.
-    child_selection_cameras = cameras_used[
-        :min(3, len(cameras_used))
-    ]
-    
-    def split_mode_selector(parent_index, child_a, child_b):
+
+    # Defined outside resume/init branch so splitting works
+    # after checkpoint resume too.
+    def split_mode_selector(
+        parent_index,
+        child_a,
+        child_b,
+    ):
+        if args.disable_child_mode_selection:
+            return child_a, child_b
+
         chosen_a, chosen_b = choose_split_child_modes(
             renderer=renderer,
             neural_scene=neural_scene,
@@ -1660,62 +2751,8 @@ def main():
             child_b=child_b,
             cameras=child_selection_cameras,
         )
-    
+
         return chosen_a, chosen_b
-
-    slices = []
-
-    for i, seed in enumerate(seeds):
-        init_params = random_slice_init(
-            rng,
-            initial_global_sh,
-        )
-
-        base_candidate = make_slice_from_seed(
-            seed=seed,
-            mode="surface",
-            init_params=init_params,
-            device=device,
-            optimize_sh=args.optimize_sh,
-        )
-
-        if args.disable_initial_mode_selection:
-            chosen = base_candidate
-            chosen_mode = "surface"
-        else:
-            chosen = choose_initial_slice_mode(
-                renderer=renderer,
-                selected_slices=slices,
-                base_candidate=base_candidate,
-                initial_global_sh=initial_global_sh,
-                optimize_sh=args.optimize_sh,
-                cameras=selection_cameras,
-                device=device,
-            )
-
-            chosen_mode = chosen.mode
-
-        slices.append(chosen)
-
-        print(
-            f"seed={i:02d} "
-            f"points={seed['num_points']} "
-            f"center={seed['center'].detach().cpu().numpy()} "
-            f"size={seed['world_size']:.3f} "
-            f"mode={chosen_mode}"
-        )
-
-    neural_scene = NeuralScene(
-        slices=slices,
-        initial_global_sh=initial_global_sh,
-        optimize_sh=args.optimize_sh,
-    ).to(device)
-
-    optimizer = make_optimizer(
-        neural_scene,
-        base_lr=args.lr,
-        optimize_sh=args.optimize_sh,
-    )
 
     gradient_stats = make_gradient_stats(
         len(neural_scene.slices)
@@ -1732,14 +2769,88 @@ def main():
     )
 
     # --------------------------------------------------------
-    # Optimization loop.
+    # Batched-renderer sanity check.
     # --------------------------------------------------------
-    for iteration in range(args.iterations):
-        optimizer.zero_grad(
-            set_to_none=True
+    with torch.no_grad():
+        sanity_rgba, _ = renderer(
+            cameras_used[0],
+            neural_scene,
         )
 
-        total_image_loss = 0.0
+    if not torch.isfinite(sanity_rgba).all():
+        raise RuntimeError(
+            "Non-finite output from batched renderer."
+        )
+
+    print(
+        "Batched renderer sanity output:",
+        tuple(sanity_rgba.shape),
+    )
+
+    # --------------------------------------------------------
+    # Optimization loop.
+    # --------------------------------------------------------
+    for iteration in range(
+        start_iteration,
+        args.iterations,
+    ):
+        new_stage = get_optimization_stage(
+            iteration=iteration,
+            optimize_sh=args.optimize_sh,
+        )
+
+        if new_stage != current_stage:
+            current_stage = new_stage
+
+            if (
+                args.optimize_sh
+                and current_stage == "lighting"
+            ):
+                neural_scene.lighting.raw_global_sh_delta.requires_grad_(
+                    iteration
+                    >= args.global_sh_warmup_iterations
+                )
+
+            optimizer = make_optimizer(
+                neural_scene=neural_scene,
+                stage=current_stage,
+                optimize_sh=args.optimize_sh,
+            )
+
+            print(
+                f"[SCHEDULE] Iteration {iteration}: "
+                f"stage={current_stage}"
+            )
+
+        if (
+            args.optimize_sh
+            and iteration == args.global_sh_warmup_iterations
+            and current_stage == "lighting"
+        ):
+            neural_scene.lighting.raw_global_sh_delta.requires_grad_(
+                True
+            )
+
+            optimizer = make_optimizer(
+                neural_scene=neural_scene,
+                stage=current_stage,
+                optimize_sh=args.optimize_sh,
+            )
+
+            print(
+                "[LIGHTING] Enabled global SH optimization."
+            )
+
+        optimizer.zero_grad(set_to_none=True)
+
+        # Kept as GPU tensor to avoid CPU sync per camera.
+        total_image_loss = torch.zeros(
+            (),
+            device=device,
+            dtype=torch.float32,
+        )
+
+        valid_camera_count = 0
 
         for camera in cameras_used:
             predicted_rgba, _ = renderer(
@@ -1760,14 +2871,44 @@ def main():
             camera_loss = image_loss(
                 predicted_rgba,
                 target_rgb,
-            ) / len(cameras_used)
-
-            camera_loss.backward()
-
-            total_image_loss += (
-                camera_loss.detach().item()
-                * len(cameras_used)
             )
+
+            if (
+                not torch.isfinite(camera_loss)
+                or not torch.isfinite(predicted_rgba).all()
+            ):
+                print(
+                    f"[WARN] Non-finite render/loss at "
+                    f"iteration={iteration}, "
+                    f"camera={camera.image_name}; skipped."
+                )
+                continue
+
+            scaled_loss = camera_loss / len(
+                cameras_used
+            )
+
+            scaled_loss.backward()
+
+            total_image_loss = (
+                total_image_loss
+                + scaled_loss.detach()
+            )
+
+            valid_camera_count += 1
+
+            del predicted_rgba
+            del target_rgb
+            del camera_loss
+            del scaled_loss
+
+        if valid_camera_count == 0:
+            print(
+                f"[WARN] No valid cameras at iteration "
+                f"{iteration}; skipping update."
+            )
+            optimizer.zero_grad(set_to_none=True)
+            continue
 
         loss_parameter_reg = parameter_regularization(
             neural_scene
@@ -1799,6 +2940,14 @@ def main():
             + loss_global_sh
         )
 
+        if not torch.isfinite(loss_regularization):
+            print(
+                f"[WARN] Non-finite regularization at "
+                f"iteration={iteration}; skipping update."
+            )
+            optimizer.zero_grad(set_to_none=True)
+            continue
+
         loss_regularization.backward()
 
         accumulate_gradient_stats(
@@ -1806,10 +2955,37 @@ def main():
             gradient_stats,
         )
 
-        torch.nn.utils.clip_grad_norm_(
+        bad_gradients = []
+
+        for name, parameter in (
+            neural_scene.named_parameters()
+        ):
+            if (
+                parameter.grad is not None
+                and not torch.isfinite(parameter.grad).all()
+            ):
+                bad_gradients.append(name)
+
+        if bad_gradients:
+            print(
+                f"[WARN] Non-finite gradients at "
+                f"iteration={iteration}; skipping update."
+            )
+            print("Bad parameters:", bad_gradients)
+            optimizer.zero_grad(set_to_none=True)
+            continue
+
+        grad_norm = torch.nn.utils.clip_grad_norm_(
             neural_scene.parameters(),
             max_norm=MAX_GRAD_NORM,
+            error_if_nonfinite=True,
         )
+
+        if iteration % 100 == 0:
+            print(
+                f"[DEBUG] iter={iteration} "
+                f"grad_norm={grad_norm.item():.6e}"
+            )
 
         optimizer.step()
 
@@ -1852,12 +3028,27 @@ def main():
             )
 
             if do_prune:
-                prune_indices = choose_prune_indices(
-                    slice_stats=slice_stats,
-                    min_max_alpha=0.01,
-                    min_alpha_mass=5.0,
-                    min_visible_views=1,
-                    min_remaining_slices=1,
+                prune_cameras = cameras_used[
+                    :min(
+                        args.prune_selection_cameras,
+                        len(cameras_used),
+                    )
+                ]
+
+                prune_indices = (
+                    choose_contribution_prune_indices(
+                        renderer=renderer,
+                        neural_scene=neural_scene,
+                        cameras=prune_cameras,
+                        slice_stats=slice_stats,
+                        max_candidates=(
+                            args.contribution_prune_candidates
+                        ),
+                        max_prunes=args.max_prunes_per_update,
+                        contribution_threshold=(
+                            args.contribution_threshold
+                        ),
+                    )
                 )
 
                 if prune_indices:
@@ -1871,7 +3062,7 @@ def main():
                         prune_indices,
                     )
 
-                    # Skip split after prune for this first version.
+                    # Do not split during same update.
                     do_split = False
 
             if do_split:
@@ -1897,9 +3088,15 @@ def main():
                 len(neural_scene.slices),
             )
 
+            # Keep current schedule stage after topology change.
+            current_stage = get_optimization_stage(
+                iteration=iteration,
+                optimize_sh=args.optimize_sh,
+            )
+
             optimizer = make_optimizer(
-                neural_scene,
-                base_lr=args.lr,
+                neural_scene=neural_scene,
+                stage=current_stage,
                 optimize_sh=args.optimize_sh,
             )
 
@@ -1913,19 +3110,19 @@ def main():
             )
 
         # ----------------------------------------------------
-        # Checkpoint.
+        # Checkpoint / preview.
         # ----------------------------------------------------
         if (
             args.checkpoint_interval > 0
             and iteration > 0
             and iteration % args.checkpoint_interval == 0
         ):
-            path = output_dir / (
+            checkpoint_path = output_dir / (
                 f"checkpoint_iter_{iteration:06d}.pt"
             )
 
             save_neural_scene_checkpoint(
-                path=path,
+                path=checkpoint_path,
                 neural_scene=neural_scene,
                 optimizer=optimizer,
                 iteration=iteration,
@@ -1933,10 +3130,23 @@ def main():
                     "num_slices": len(neural_scene.slices),
                     "initial_env_id": initial_env_id,
                     "optimize_sh": args.optimize_sh,
+                    "fno_radius": FNO_RADIUS,
                 },
             )
 
-            print("Saved checkpoint:", path)
+            save_checkpoint_previews(
+                renderer=renderer,
+                neural_scene=neural_scene,
+                cameras=cameras_used,
+                output_dir=output_dir,
+                iteration=iteration,
+                max_views=args.preview_views,
+            )
+
+            print(
+                "Saved checkpoint:",
+                checkpoint_path,
+            )
 
         # ----------------------------------------------------
         # Logging.
@@ -1945,20 +3155,22 @@ def main():
             iteration % 25 == 0
             or iteration == args.iterations - 1
         ):
-            image_value = (
-                total_image_loss / len(cameras_used)
+            effective_global_delta = (
+                neural_scene.global_sh
+                - neural_scene.lighting.initial_global_sh
             )
 
             total_value = (
-                image_value
-                + loss_regularization.detach().item()
+                total_image_loss
+                + loss_regularization.detach()
             )
 
             print(
                 f"iter={iteration:05d} "
-                f"loss={total_value:.8f} "
-                f"image={image_value:.8f} "
-                f"reg={loss_regularization.item():.8f}"
+                f"loss={total_value.item():.8f} "
+                f"image={total_image_loss.item():.8f} "
+                f"reg={loss_regularization.item():.8f} "
+                f"slices={len(neural_scene.slices)}"
             )
 
             print(
@@ -1969,24 +3181,39 @@ def main():
                 .item(),
             )
 
-            for i, neural_slice in enumerate(
+            print(
+                "  global SH effective delta norm:",
+                effective_global_delta.detach()
+                .norm()
+                .item(),
+            )
+
+            print(
+                "  global SH max abs delta:",
+                effective_global_delta.detach()
+                .abs()
+                .max()
+                .item(),
+            )
+
+            for i, s in enumerate(
                 neural_scene.slices
             ):
-                values = neural_slice.fno_values(
+                values = s.fno_values(
                     shared_sh=neural_scene.global_sh
                 )
 
                 print(
-                    f"  slice={i:02d} "
-                    f"mode={neural_slice.mode} "
-                    f"size={neural_slice.world_size.item():.4f} "
+                    f"  slice={i:03d} "
+                    f"mode={s.mode} "
+                    f"size={s.world_size.item():.4f} "
                     f"sigma={values['sigma'].item():.4f} "
                     f"opacity={values['opacity'].item():.4f} "
                     f"hue={values['hue'].item():.4f}"
                 )
 
     # --------------------------------------------------------
-    # Final image outputs.
+    # Final output.
     # --------------------------------------------------------
     first_camera = cameras_used[0]
 
@@ -1999,7 +3226,7 @@ def main():
     final_rgba = final_rgba.clamp(0.0, 1.0)
 
     final_np = final_rgba[0].cpu().numpy()
-    target = first_camera.original_image.detach()
+    target_rgb = first_camera.original_image.detach()
 
     save_rgba_chw(
         final_np,
@@ -2022,64 +3249,54 @@ def main():
     )
 
     save_rgb_chw(
-        target,
+        target_rgb,
         output_dir / "target_rgb.png",
     )
 
-    save_comparison(
-        predicted_rgba=final_rgba,
-        target_rgb=target,
-        path=output_dir / "target_vs_final.png",
+    target_np = target_rgb.cpu().numpy()
+    visible_np = (
+        visible_rgb_from_rgba(final_rgba)[0]
+        .detach()
+        .cpu()
+        .numpy()
     )
 
-    # --------------------------------------------------------
-    # Save compact result metadata.
-    # --------------------------------------------------------
-    slice_data = []
+    comparison = np.concatenate(
+        [
+            np.transpose(target_np, (1, 2, 0)),
+            np.transpose(visible_np, (1, 2, 0)),
+        ],
+        axis=1,
+    )
 
-    for i, s in enumerate(neural_scene.slices):
-        values = s.fno_values(
-            shared_sh=neural_scene.global_sh
-        )
+    imageio.imwrite(
+        output_dir / "target_vs_final.png",
+        (
+            np.clip(comparison, 0.0, 1.0)
+            * 255.0
+            + 0.5
+        ).astype(np.uint8),
+    )
 
-        slice_data.append(
-            {
-                "index": i,
-                "mode": s.mode,
-                "center": s.center.detach()
-                .cpu()
-                .numpy()
-                .tolist(),
-                "world_size": s.world_size.item(),
-                "ctrl": values["ctrl"].detach()
-                .cpu()
-                .numpy()
-                .tolist(),
-                "sigma": values["sigma"].item(),
-                "hue": values["hue"].item(),
-                "saturation": values["saturation"].item(),
-                "opacity": values["opacity"].item(),
-                "roughness": values["roughness"].item(),
-                "sh": values["sh"].detach()
-                .cpu()
-                .numpy()
-                .tolist(),
-            }
-        )
+    # Save final checkpoint too.
+    final_checkpoint = output_dir / (
+        f"checkpoint_iter_{args.iterations:06d}_final.pt"
+    )
 
-    torch.save(
-        {
-            "slices": slice_data,
-            "global_sh": neural_scene.global_sh.detach()
-            .cpu()
-            .numpy(),
-            "initial_environment_id": initial_env_id,
-            "fno_radius": FNO_RADIUS,
+    save_neural_scene_checkpoint(
+        path=final_checkpoint,
+        neural_scene=neural_scene,
+        optimizer=optimizer,
+        iteration=args.iterations,
+        metadata={
+            "num_slices": len(neural_scene.slices),
+            "initial_env_id": initial_env_id,
             "optimize_sh": args.optimize_sh,
+            "fno_radius": FNO_RADIUS,
         },
-        output_dir / "optimized_neural_slices.pt",
     )
 
+    print("Saved final checkpoint:", final_checkpoint)
     print("Done.")
     print("Outputs:", output_dir)
 

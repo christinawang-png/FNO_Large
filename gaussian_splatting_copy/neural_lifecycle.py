@@ -589,6 +589,9 @@ def voxel_chunk_seeds(
         key=lambda x: x["num_points"],
         reverse=True,
     )
+    
+    if max_chunks is None or max_chunks <= 0:
+        return candidates
 
     return candidates[:max_chunks]
 
@@ -597,6 +600,42 @@ def voxel_chunk_seeds(
 # CHECKPOINTING
 # ============================================================
 
+def serialize_slice(neural_slice):
+    """
+    Store enough information to reconstruct one slice object.
+    """
+    values = neural_slice.fno_values()
+
+    return {
+        "mode": neural_slice.mode,
+        "center": neural_slice.center.detach().cpu(),
+        "world_size": float(neural_slice.world_size.detach().cpu()),
+
+        "ctrl_values": values["ctrl"].detach().cpu(),
+        "sigma": float(values["sigma"].detach().cpu()),
+
+        "hue": float(values["hue"].detach().cpu()),
+        "saturation": float(values["saturation"].detach().cpu()),
+        "opacity": float(values["opacity"].detach().cpu()),
+        "roughness": float(values["roughness"].detach().cpu()),
+
+        "metallic": float(
+            neural_slice.metallic_value.detach().cpu()
+        ),
+        "specular": float(
+            neural_slice.specular_value.detach().cpu()
+        ),
+
+        "sh_values": neural_slice.initial_sh.detach().cpu(),
+        "optimize_environment": bool(
+            neural_slice.optimize_environment
+        ),
+        "local_sh_bound": float(
+            neural_slice.local_sh_bound
+        ),
+    }
+
+
 def save_neural_scene_checkpoint(
     path,
     neural_scene,
@@ -604,27 +643,33 @@ def save_neural_scene_checkpoint(
     iteration,
     metadata=None,
 ):
-    """
-    Save model/optimizer state.
-
-    `metadata` should contain structural information needed to
-    reconstruct the same slice list before loading state_dict.
-    """
     path = Path(path)
-    path.parent.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    slice_specs = [
+        serialize_slice(s)
+        for s in neural_scene.slices
+    ]
 
     torch.save(
         {
             "iteration": iteration,
             "scene_state": neural_scene.state_dict(),
             "optimizer_state": optimizer.state_dict(),
+
+            "slice_specs": slice_specs,
+
+            "initial_global_sh": (
+                neural_scene.lighting.initial_global_sh
+                .detach()
+                .cpu()
+            ),
+
             "metadata": metadata or {},
         },
         path,
     )
+    
 
 
 def load_neural_scene_checkpoint(
