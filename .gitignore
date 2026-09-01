@@ -9,10 +9,10 @@
 
 # Keep Python and Slurm files anywhere under FNO_Large
 !*.py
-!*.slurm
 
 # Keep the entire gaussian_splatting_copy directory
 !/gaussian_splatting_copy/
 !/gaussian_splatting_copy/**
 
 /gaussian_splatting_copy/*.out
+gaussian_splatting_copy/submit.slurm
