@@ -104,9 +104,9 @@ SHAPE_WARMUP_ITERS = 500
 LIGHTING_START_ITERS = 1000
 
 # Early stage: shape/material adapt fast.
-EARLY_PLACEMENT_LR = 1e-3
-EARLY_SHAPE_LR = 5e-3
-EARLY_MATERIAL_LR = 7e-3
+EARLY_PLACEMENT_LR = 1e-2
+EARLY_SHAPE_LR = 5e-2
+EARLY_MATERIAL_LR = 7e-2
 
 # Middle stage: stabilize geometry.
 MID_PLACEMENT_LR = 5e-4
@@ -121,6 +121,15 @@ LATE_MATERIAL_LR = 5e-4
 # Lighting is deliberately very slow.
 LOCAL_SH_LR = 1e-7
 GLOBAL_SH_LR = 1e-8
+
+# Local patch rendering. Avoid full HxW layer per slice.
+USE_LOCAL_ROI_RENDERING = True
+
+# Extra room around the estimated projected square footprint.
+ROI_MARGIN_PIXELS = 16
+
+# Safety cap for a single local region.
+MAX_ROI_SIDE_PIXELS = 1024
 
 
 # ============================================================
@@ -644,6 +653,235 @@ def place_patch_uniform(
         padding_mode="zeros",
         align_corners=True,
     )
+    
+
+def place_patch_uniform_roi(
+    patch,
+    center_x,
+    center_y,
+    patch_size,
+    canvas_height,
+    canvas_width,
+    margin_pixels=ROI_MARGIN_PIXELS,
+    max_roi_side=MAX_ROI_SIDE_PIXELS,
+):
+    """
+    Render ONE premultiplied RGBA patch into only its local ROI.
+
+    Inputs:
+        patch:      [1,4,64,64]
+        center_x/y: scalar tensors in full-image pixel coordinates
+        patch_size: scalar tensor, desired square side in pixels
+
+    Returns:
+        roi_rgba: [1,4,roi_h,roi_w]
+        x0, y0: Python integer location of ROI in the full canvas
+
+    Notes:
+        - patch position remains differentiable inside the ROI.
+        - ROI bounds use detached integer values, so crossing an ROI
+          boundary is not differentiable.
+        - Use margin_pixels to make boundary changes infrequent.
+    """
+    if patch.shape[0] != 1:
+        raise ValueError(
+            f"ROI placement currently expects batch size 1, got {patch.shape}"
+        )
+
+    device = patch.device
+    dtype = patch.dtype
+
+    # We use detached values only to select the local storage region.
+    # The placement grid below continues to use original tensor values.
+    center_x_value = float(center_x.detach().cpu().item())
+    center_y_value = float(center_y.detach().cpu().item())
+    patch_size_value = float(patch_size.detach().cpu().item())
+
+    # Clamp pathological sizes before determining ROI.
+    patch_size_value = max(2.0, patch_size_value)
+
+    half = 0.5 * patch_size_value + float(margin_pixels)
+
+    x0 = max(0, int(math.floor(center_x_value - half)))
+    x1 = min(canvas_width, int(math.ceil(center_x_value + half)))
+
+    y0 = max(0, int(math.floor(center_y_value - half)))
+    y1 = min(canvas_height, int(math.ceil(center_y_value + half)))
+
+    roi_w = x1 - x0
+    roi_h = y1 - y0
+
+    if roi_w <= 0 or roi_h <= 0:
+        return None, x0, y0
+
+    # Limit pathological nearby slices.
+    if roi_w > max_roi_side or roi_h > max_roi_side:
+        roi_w = min(roi_w, max_roi_side)
+        roi_h = min(roi_h, max_roi_side)
+
+        # Recenter capped ROI around the projected center.
+        x0 = max(
+            0,
+            min(
+                canvas_width - roi_w,
+                int(round(center_x_value - roi_w / 2)),
+            ),
+        )
+
+        y0 = max(
+            0,
+            min(
+                canvas_height - roi_h,
+                int(round(center_y_value - roi_h / 2)),
+            ),
+        )
+
+    # Coordinates of ROI center in full-canvas normalized coordinates.
+    canvas_wm1 = float(max(canvas_width - 1, 1))
+    canvas_hm1 = float(max(canvas_height - 1, 1))
+
+    center_x_norm = (
+        2.0 * center_x / canvas_wm1 - 1.0
+    )
+
+    center_y_norm = (
+        2.0 * center_y / canvas_hm1 - 1.0
+    )
+
+    # Full image -> patch transform scale.
+    scale_x = canvas_wm1 / patch_size.clamp_min(2.0)
+    scale_y = canvas_hm1 / patch_size.clamp_min(2.0)
+
+    # We must construct the local grid manually because affine_grid
+    # normally assumes its output covers the whole canvas.
+    ys = torch.arange(
+        y0,
+        y0 + roi_h,
+        dtype=dtype,
+        device=device,
+    )
+
+    xs = torch.arange(
+        x0,
+        x0 + roi_w,
+        dtype=dtype,
+        device=device,
+    )
+
+    yy, xx = torch.meshgrid(
+        ys,
+        xs,
+        indexing="ij",
+    )
+
+    # Convert full image ROI pixels to normalized full-canvas coords.
+    full_x_norm = 2.0 * xx / canvas_wm1 - 1.0
+    full_y_norm = 2.0 * yy / canvas_hm1 - 1.0
+
+    # Map full-canvas normalized coordinates -> patch coordinates.
+    patch_x = scale_x * (
+        full_x_norm - center_x_norm
+    )
+
+    patch_y = scale_y * (
+        full_y_norm - center_y_norm
+    )
+
+    grid = torch.stack(
+        [patch_x, patch_y],
+        dim=-1,
+    ).unsqueeze(0)  # [1, roi_h, roi_w, 2]
+
+    roi_rgba = F.grid_sample(
+        patch,
+        grid,
+        mode="bilinear",
+        padding_mode="zeros",
+        align_corners=True,
+    )
+
+    return roi_rgba, x0, y0
+    
+
+def alpha_over_roi(
+    canvas,
+    roi_rgba,
+    x0,
+    y0,
+):
+    """
+    Alpha-composite one premultiplied ROI patch over a full canvas.
+
+    canvas:
+        [1,4,H,W]
+
+    roi_rgba:
+        [1,4,roi_h,roi_w]
+
+    x0/y0:
+        integer top-left ROI placement on canvas.
+    """
+    if roi_rgba is None:
+        return canvas
+
+    _, _, canvas_h, canvas_w = canvas.shape
+    _, _, roi_h, roi_w = roi_rgba.shape
+
+    x1 = min(x0 + roi_w, canvas_w)
+    y1 = min(y0 + roi_h, canvas_h)
+
+    if x0 >= x1 or y0 >= y1:
+        return canvas
+
+    valid_w = x1 - x0
+    valid_h = y1 - y0
+
+    roi = roi_rgba[
+        :,
+        :,
+        :valid_h,
+        :valid_w,
+    ]
+
+    back = canvas[
+        :,
+        :,
+        y0:y1,
+        x0:x1,
+    ]
+
+    back_color = back[:, :3]
+    back_alpha = back[:, 3:4]
+
+    front_color = roi[:, :3]
+    front_alpha = roi[:, 3:4]
+
+    output_color = (
+        front_color
+        + (1.0 - front_alpha) * back_color
+    )
+
+    output_alpha = (
+        front_alpha
+        + (1.0 - front_alpha) * back_alpha
+    )
+
+    output_roi = torch.cat(
+        [output_color, output_alpha],
+        dim=1,
+    )
+
+    # This CopySlices operation preserves gradients from the output
+    # canvas back to output_roi / roi_rgba.
+    canvas = canvas.clone()
+    canvas[
+        :,
+        :,
+        y0:y1,
+        x0:x1,
+    ] = output_roi
+
+    return canvas
 
 
 def run_fno_in_chunks(
@@ -1067,44 +1305,42 @@ class NeuralSceneRenderer(nn.Module):
         sorted_center_y = center_y[sort_indices]
         sorted_patch_sizes = patch_sizes[sort_indices]
 
-        # ----------------------------------------------------
-        # Phase C: chunked full-canvas placement.
-        # ----------------------------------------------------
-        composite = None
-
-        for start in range(
-            0,
-            num_slices,
-            placement_batch_size,
-        ):
-            end = min(
-                start + placement_batch_size,
-                num_slices,
-            )
-
-            chunk_layers = place_patch_uniform(
-                patch=sorted_patches[start:end],
+        # --------------------------------------------------------
+        # Phase C: local ROI placement and compositing.
+        #
+        # sorted_patches are already ordered far -> near.
+        # --------------------------------------------------------
+        composite = torch.zeros(
+            1,
+            4,
+            canvas_h,
+            canvas_w,
+            dtype=all_patches.dtype,
+            device=device,
+        )
+        
+        for sorted_index in range(num_slices):
+            patch = sorted_patches[
+                sorted_index:sorted_index + 1
+            ]
+        
+            roi_rgba, x0, y0 = place_patch_uniform_roi(
+                patch=patch,
+                center_x=sorted_center_x[sorted_index],
+                center_y=sorted_center_y[sorted_index],
+                patch_size=sorted_patch_sizes[sorted_index],
                 canvas_height=canvas_h,
                 canvas_width=canvas_w,
-                center_x=sorted_center_x[start:end],
-                center_y=sorted_center_y[start:end],
-                patch_size=sorted_patch_sizes[start:end],
+                margin_pixels=ROI_MARGIN_PIXELS,
+                max_roi_side=MAX_ROI_SIDE_PIXELS,
             )
-
-            chunk_composite = (
-                self.composite_layers_far_to_near(
-                    chunk_layers
-                )
+        
+            composite = alpha_over_roi(
+                canvas=composite,
+                roi_rgba=roi_rgba,
+                x0=x0,
+                y0=y0,
             )
-
-            if composite is None:
-                composite = chunk_composite
-            else:
-                # Current chunk is nearer than prior chunks.
-                composite = self.alpha_over(
-                    back=composite,
-                    front=chunk_composite,
-                )
 
         diagnostics = []
 
