@@ -15,6 +15,8 @@ import torch.nn.functional as F
 
 import random
 
+from torch.utils.checkpoint import checkpoint
+
 
 # ============================================================
 # PATH SETUP
@@ -54,6 +56,8 @@ from neural_lifecycle import (
 from tiled_roi_renderer import (
     render_rois_to_tiled_canvas,
 )
+
+from tile_patch_renderer import TilePatchRenderer
 
 
 # ============================================================
@@ -108,7 +112,7 @@ SHAPE_WARMUP_ITERS = 500
 LIGHTING_START_ITERS = 1000
 
 # Early stage: shape/material adapt fast.
-EARLY_PLACEMENT_LR = 1e-2
+EARLY_PLACEMENT_LR = 1e-4
 EARLY_SHAPE_LR = 5e-2
 EARLY_MATERIAL_LR = 7e-2
 
@@ -657,34 +661,43 @@ def run_fno_in_chunks(
     model,
     params,
     batch_size,
+    use_activation_checkpointing=True,
 ):
     """
-    params: [N,D]
-    returns: [N,4,64,64]
+    params:
+        [N, latent_dim]
+
+    returns:
+        [N, 4, 64, 64]
+
+    With activation checkpointing enabled, FNO activations are
+    discarded during forward and recomputed during backward.
     """
     if params.shape[0] == 0:
-        raise RuntimeError("Cannot run FNO on empty batch.")
+        raise RuntimeError("Cannot run FNO on an empty batch.")
 
     outputs = []
 
-    for start in range(
-        0,
-        params.shape[0],
-        batch_size,
-    ):
-        end = min(
-            start + batch_size,
-            params.shape[0],
-        )
+    for start in range(0, params.shape[0], batch_size):
+        end = min(start + batch_size, params.shape[0])
 
-        outputs.append(
-            model(params[start:end])
-        )
+        param_chunk = params[start:end]
 
-    return torch.cat(
-        outputs,
-        dim=0,
-    )
+        if (
+            use_activation_checkpointing
+            and torch.is_grad_enabled()
+        ):
+            output_chunk = checkpoint(
+                model,
+                param_chunk,
+                use_reentrant=False,
+            )
+        else:
+            output_chunk = model(param_chunk)
+
+        outputs.append(output_chunk)
+
+    return torch.cat(outputs, dim=0)
 
 
 # ============================================================
@@ -705,7 +718,12 @@ class NeuralSceneRenderer(nn.Module):
         placement_batch_size=8,
         flip_projection_y=False,
         flip_fno_vertical=False,
+        use_tile_renderer=False,
         use_visibility_culling=False,
+        tile_size=128,
+        tile_roi_margin=16,
+        max_patches_per_tile=None,
+        use_fno_activation_checkpointing=True,
     ):
         super().__init__()
 
@@ -732,6 +750,20 @@ class NeuralSceneRenderer(nn.Module):
         )
         self.use_visibility_culling = bool(
             use_visibility_culling
+        )
+        
+        self.use_tile_renderer = bool(
+            use_tile_renderer
+        )
+
+        self.tile_renderer = TilePatchRenderer(
+            tile_size=int(tile_size),
+            roi_margin=int(tile_roi_margin),
+            max_patches_per_tile=max_patches_per_tile,
+        )
+        
+        self.use_fno_activation_checkpointing = bool(
+            use_fno_activation_checkpointing
         )
 
         for model in [
@@ -976,9 +1008,12 @@ class NeuralSceneRenderer(nn.Module):
             )
 
             surface_patches = run_fno_in_chunks(
-                self.surface_model,
-                surface_params,
+                model=self.surface_model,
+                params=surface_params,
                 batch_size=self.fno_batch_size,
+                use_activation_checkpointing=(
+                    self.use_fno_activation_checkpointing
+                ),
             )
 
             if self.flip_fno_vertical:
@@ -1006,9 +1041,12 @@ class NeuralSceneRenderer(nn.Module):
             )
 
             volume_patches = run_fno_in_chunks(
-                self.volume_model,
-                volume_params,
+                model=self.volume_model,
+                params=volume_params,
                 batch_size=self.fno_batch_size,
+                use_activation_checkpointing=(
+                    self.use_fno_activation_checkpointing
+                ),
             )
 
             if self.flip_fno_vertical:
@@ -1082,22 +1120,47 @@ class NeuralSceneRenderer(nn.Module):
         sorted_center_y = center_y[sort_indices]
         sorted_patch_sizes = patch_sizes[sort_indices]
 
-        # --------------------------------------------------------
-        # Phase C: local ROI placement and compositing.
+        # ----------------------------------------------------
+        # Phase C: render patch primitives into one tiled output.
         #
-        # sorted_patches are already ordered far -> near.
-        # --------------------------------------------------------
-        composite = render_rois_to_tiled_canvas(
-            sorted_patches=sorted_patches,
-            sorted_center_x=sorted_center_x,
-            sorted_center_y=sorted_center_y,
-            sorted_patch_sizes=sorted_patch_sizes,
-            canvas_height=canvas_h,
-            canvas_width=canvas_w,
-            tile_size=128,
-            margin_pixels=16,
-            max_roi_side=512,
-        )
+        # TilePatchRenderer:
+        #   - bins patches into local screen tiles
+        #   - samples only tile-local patch footprints
+        #   - composites far -> near within each tile
+        #   - allocates the full output image only once
+        # ----------------------------------------------------
+        if self.use_tile_renderer:
+            if not hasattr(self, "_printed_renderer_mode"):
+                print("[RENDERER] Using TilePatchRenderer")
+                self._printed_renderer_mode = True
+        
+            composite = self.tile_renderer(
+                patches=all_patches,
+                center_x=center_x,
+                center_y=center_y,
+                patch_size=patch_sizes,
+                depths=depths,
+                image_height=canvas_h,
+                image_width=canvas_w,
+            )
+        else:
+            if not hasattr(self, "_printed_renderer_mode"):
+                print("[RENDERER] Using reference ROI renderer")
+                self._printed_renderer_mode = True
+            # Keep your existing reference ROI renderer here.
+            #
+            # Example:
+            composite = render_rois_to_tiled_canvas(
+                sorted_patches=sorted_patches,
+                sorted_center_x=sorted_center_x,
+                sorted_center_y=sorted_center_y,
+                sorted_patch_sizes=sorted_patch_sizes,
+                canvas_height=canvas_h,
+                canvas_width=canvas_w,
+                tile_size=128,
+                margin_pixels=16,
+                max_roi_side=512,
+            )
 
         diagnostics = []
 
@@ -2478,8 +2541,50 @@ def main():
     parser.add_argument(
         "--cameras_per_step",
         type=int,
-        default=2,
+        default=10,
         help="Number of cameras randomly used per optimization step.",
+    )
+    
+    parser.add_argument(
+        "--use_tile_renderer",
+        action="store_true",
+        help=(
+            "Use the tile-binned patch renderer instead of the "
+            "older ROI/full-canvas placement path."
+        ),
+    )
+    
+    parser.add_argument(
+        "--tile_size",
+        type=int,
+        default=128,
+        help="Screen tile size for tile-binned patch rendering.",
+    )
+    
+    parser.add_argument(
+        "--tile_roi_margin",
+        type=int,
+        default=16,
+        help="Extra ROI margin in pixels for tile assignment.",
+    )
+    
+    parser.add_argument(
+        "--max_patches_per_tile",
+        type=int,
+        default=0,
+        help=(
+            "Optional safety cap on patches per tile. "
+            "Use 0 for no cap."
+        ),
+    )
+    
+    parser.add_argument(
+        "--disable_fno_activation_checkpointing",
+        action="store_true",
+        help=(
+            "Disable FNO activation checkpointing. "
+            "Faster, but uses more GPU memory."
+        ),
     )
 
     args = parser.parse_args()
@@ -2528,6 +2633,12 @@ def main():
             f"surface={surface_dim}, volume={volume_dim}"
         )
 
+    max_patches_per_tile = (
+        None
+        if args.max_patches_per_tile <= 0
+        else args.max_patches_per_tile
+    )
+    
     renderer = NeuralSceneRenderer(
         surface_model=surface_model,
         volume_model=volume_model,
@@ -2540,6 +2651,14 @@ def main():
         placement_batch_size=args.placement_batch_size,
         flip_projection_y=args.flip_projection_y,
         flip_fno_vertical=args.flip_fno_vertical,
+        use_tile_renderer=args.use_tile_renderer,
+        tile_size=args.tile_size,
+        tile_roi_margin=args.tile_roi_margin,
+        max_patches_per_tile=max_patches_per_tile,
+        use_visibility_culling=args.use_visibility_culling,
+        use_fno_activation_checkpointing=(
+            not args.disable_fno_activation_checkpointing
+        ),
     ).to(device)
 
     # --------------------------------------------------------
@@ -2917,6 +3036,9 @@ def main():
             for i in selected_camera_indices
         ]
         
+        if iteration == 0:
+            torch.cuda.reset_peak_memory_stats()
+            
         for camera in step_cameras:
             predicted_rgba, _ = renderer(
                 camera,
@@ -3258,21 +3380,21 @@ def main():
                 .max()
                 .item(),
             )
-
-            for i, s in enumerate(
-                neural_scene.slices
-            ):
-                values = s.fno_values(
-                    shared_sh=neural_scene.global_sh
+            
+            if iteration == 0:
+                peak_gib = (
+                    torch.cuda.max_memory_allocated()
+                    / (1024 ** 3)
                 )
-
+            
+                reserved_gib = (
+                    torch.cuda.max_memory_reserved()
+                    / (1024 ** 3)
+                )
+            
                 print(
-                    f"  slice={i:03d} "
-                    f"mode={s.mode} "
-                    f"size={s.world_size.item():.4f} "
-                    f"sigma={values['sigma'].item():.4f} "
-                    f"opacity={values['opacity'].item():.4f} "
-                    f"hue={values['hue'].item():.4f}"
+                    f"[MEMORY] peak_allocated={peak_gib:.3f} GiB "
+                    f"peak_reserved={reserved_gib:.3f} GiB"
                 )
 
     # --------------------------------------------------------

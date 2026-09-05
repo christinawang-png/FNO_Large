@@ -208,8 +208,9 @@ class PlaneDatasetParamsToImageSharded(Dataset):
         sigma     = float(shp["sigma"])
 
         # 2) material params
-        hue        = float(row["hue"])
-        saturation = float(row["saturation"])
+        base_color_r = float(row["base_color_r"])
+        base_color_g = float(row["base_color_g"])
+        base_color_b = float(row["base_color_b"])
         metallic   = float(row["metallic"])
         roughness  = float(row["roughness"])
         opacity    = float(row["opacity"])
@@ -225,7 +226,7 @@ class PlaneDatasetParamsToImageSharded(Dataset):
         scalars = (
             ctrl_vals
             + [sigma]
-            + [hue, saturation, metallic, roughness, opacity, specular]
+            + [base_color_r, base_color_g, base_color_b, metallic, roughness, opacity, specular]
             + [sin_phi, cos_phi, sin_th, cos_th, radius]
         )
 
@@ -295,8 +296,8 @@ def main():
     criterion = nn.MSELoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
 
-    resume_path = "fno_params_to_image_cameras_larger050.pt"  # or None
-    start_epoch = 50
+    resume_path = None  # or None
+    start_epoch = 0
     num_epochs  = 150  # total epochs you want to reach
 
     resume = True

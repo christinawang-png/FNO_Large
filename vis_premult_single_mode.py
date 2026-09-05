@@ -16,7 +16,7 @@ from train_premult_single_mode import (
 def main():
     # ---- parse args ----
     mode = "surface"
-    ckpt_path = "fno_premult_surface_final.pt"
+    ckpt_path = "fno_premult_surface_epoch128_color.pt"
     if "--mode" in sys.argv:
         i = sys.argv.index("--mode") + 1
         if i < len(sys.argv):
