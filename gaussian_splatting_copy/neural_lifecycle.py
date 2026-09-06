@@ -564,16 +564,37 @@ def voxel_chunk_seeds(
 
     candidates = []
 
+    # Make sure inverse is a simple [N] vector.
+    inverse = inverse.reshape(-1)
+    counts = counts.reshape(-1)
+
     for voxel_id in range(unique_voxels.shape[0]):
         count = int(counts[voxel_id].item())
 
         if count < min_points:
             continue
 
-        points = xyz[inverse == voxel_id]
+        # Explicit indices are safer than direct boolean indexing.
+        point_indices = torch.nonzero(
+            inverse == voxel_id,
+            as_tuple=True,
+        )[0]
+
+        # Defensive guard: should agree with `count`, but avoid crash.
+        if point_indices.numel() == 0:
+            print(
+                f"[WARN] voxel_id={voxel_id} has count={count} "
+                "but no selected points; skipping."
+            )
+            continue
+
+        points = xyz.index_select(
+            0,
+            point_indices,
+        )
 
         center = points.median(
-            dim=0
+            dim=0,
         ).values
 
         candidates.append(

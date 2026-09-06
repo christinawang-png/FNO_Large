@@ -65,11 +65,11 @@ from tile_patch_renderer import TilePatchRenderer
 # ============================================================
 
 SURFACE_CHECKPOINT = (
-    FNO_ROOT / "fno_premult_surface_final.pt"
+    FNO_ROOT / "fno_premult_surface_epoch128_color.pt"
 )
 
 VOLUME_CHECKPOINT = (
-    FNO_ROOT / "fno_premult_volume_epoch025.pt"
+    FNO_ROOT / "fno_premult_volume_epoch016_color.pt"
 )
 
 DEFAULT_OUTPUT_DIR = (
@@ -113,8 +113,8 @@ LIGHTING_START_ITERS = 1000
 
 # Early stage: shape/material adapt fast.
 EARLY_PLACEMENT_LR = 1e-4
-EARLY_SHAPE_LR = 5e-2
-EARLY_MATERIAL_LR = 7e-2
+EARLY_SHAPE_LR = 5e-3
+EARLY_MATERIAL_LR = 7e-3
 
 # Middle stage: stabilize geometry.
 MID_PLACEMENT_LR = 5e-4
@@ -321,16 +321,20 @@ def random_slice_init(rng, shared_sh):
             rng.choice(SIGMA_VALUES)
         ),
 
-        "hue": float(
-            rng.uniform(0.0, 1.0)
+        "base_color_r": float(
+            rng.uniform(0.02, 1.0)
         ),
-
-        "saturation": float(
-            rng.uniform(0.3, 0.9)
+        
+        "base_color_g": float(
+            rng.uniform(0.02, 1.0)
+        ),
+        
+        "base_color_b": float(
+            rng.uniform(0.02, 1.0)
         ),
 
         "opacity": float(
-            rng.uniform(0.1, 1.0)
+            0.9
         ),
 
         "roughness": float(
@@ -373,8 +377,9 @@ def make_slice_from_seed(
         world_size=float(seed["world_size"]),
         ctrl_values=init_params["ctrl_values"],
         sigma=init_params["sigma"],
-        hue=init_params["hue"],
-        saturation=init_params["saturation"],
+        base_color_r =init_params["base_color_r"],
+        base_color_g =init_params["base_color_g"],
+        base_color_b =init_params["base_color_b"],
         opacity=init_params["opacity"],
         roughness=roughness,
         sh_values=init_params["sh_values"],
@@ -1301,12 +1306,15 @@ def parameter_regularization(neural_scene):
         ) ** 2
 
         appearance_loss = appearance_loss + (
-            values["hue"] - s.initial_hue
+            values["base_color_r"] - s.initial_base_color_r
         ) ** 2
-
+        
         appearance_loss = appearance_loss + (
-            values["saturation"]
-            - s.initial_saturation
+            values["base_color_g"] - s.initial_base_color_g
+        ) ** 2
+        
+        appearance_loss = appearance_loss + (
+            values["base_color_b"] - s.initial_base_color_b
         ) ** 2
 
         appearance_loss = appearance_loss + (
@@ -1451,8 +1459,9 @@ def make_optimizer(
         ])
 
         material_params.extend([
-            s.raw_hue,
-            s.raw_saturation,
+            s.raw_base_color_r,
+            s.raw_base_color_g,
+            s.raw_base_color_b,
             s.raw_opacity,
             s.raw_roughness,
         ])
@@ -2009,12 +2018,16 @@ def rebuild_neural_scene_from_checkpoint(
             prefix + "initial_sigma"
         ]
 
-        initial_hue = scene_state[
-            prefix + "initial_hue"
+        initial_base_color_r = scene_state[
+            prefix + "initial_base_color_r"
         ]
-
-        initial_saturation = scene_state[
-            prefix + "initial_saturation"
+        
+        initial_base_color_g = scene_state[
+            prefix + "initial_base_color_g"
+        ]
+        
+        initial_base_color_b = scene_state[
+            prefix + "initial_base_color_b"
         ]
 
         initial_opacity = scene_state[
@@ -2043,8 +2056,9 @@ def rebuild_neural_scene_from_checkpoint(
             world_size=float(initial_world_size),
             ctrl_values=initial_ctrl,
             sigma=float(initial_sigma),
-            hue=float(initial_hue),
-            saturation=float(initial_saturation),
+            base_color_r=float(initial_base_color_r),
+            base_color_g=float(initial_base_color_g),
+            base_color_b=float(initial_base_color_b),
             opacity=float(initial_opacity),
             roughness=float(initial_roughness),
             sh_values=initial_sh,
@@ -2627,10 +2641,16 @@ def main():
         )
     )
 
-    if surface_dim != 44 or volume_dim != 44:
+    if surface_dim != volume_dim:
         raise RuntimeError(
-            f"Expected latent_dim=44, got "
-            f"surface={surface_dim}, volume={volume_dim}"
+            f"Surface/volume latent mismatch: "
+            f"{surface_dim} vs {volume_dim}"
+        )
+    
+    if surface_dim != 45:
+        raise RuntimeError(
+            f"Expected RGB-conditioned latent_dim=45, "
+            f"got {surface_dim}"
         )
 
     max_patches_per_tile = (
