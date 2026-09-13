@@ -70,119 +70,153 @@ def finalize_gradient_stats(stats):
 # VISIBILITY / CONTRIBUTION STATISTICS
 # ============================================================
 
+
 @torch.no_grad()
-def collect_slice_statistics(
-    renderer,
-    neural_scene,
+def collect_batched_lifecycle_stats(
     cameras,
+    neural_scene,
+    fno_radius,
+    min_patch_size_px=2.0,
+    margin_px=64.0,
+    flip_projection_y=False,
 ):
     """
-    Render each slice individually over selected cameras and collect:
+    Cheap GPU-batched lifecycle statistics.
 
-      max_alpha:
-          Maximum alpha observed over all cameras.
+    No FNO render and no per-slice image render.
 
-      mean_alpha_mass:
-          Mean sum(alpha) over full output canvases.
-
-      mean_patch_size:
-          Mean rendered square patch size in pixels.
-
-      visible_views:
-          Number of views where max alpha exceeds threshold.
-
-    This is a forward-only diagnostic/statistics pass.
+    Returns a list of dicts, one per stored slice.
     """
-    num_slices = len(neural_scene.slices)
+    slices = neural_scene.slices
+    n = len(slices)
 
-    stats = [
-        {
-            "max_alpha": 0.0,
-            "alpha_mass_sum": 0.0,
-            "patch_size_sum": 0.0,
-            "visible_views": 0,
-            "num_views": 0,
-        }
-        for _ in range(num_slices)
-    ]
+    device = slices[0].center.device
+    dtype = slices[0].center.dtype
+
+    centers = torch.stack(
+        [s.center.detach() for s in slices],
+        dim=0,
+    )  # [N,3]
+
+    sizes = torch.stack(
+        [s.world_size.detach() for s in slices],
+        dim=0,
+    )  # [N]
+
+    # Approximate current scalar opacity.
+    opacities = torch.stack(
+        [
+            s.fno_values(
+                shared_sh=neural_scene.global_sh
+            )["opacity"].detach()
+            for s in slices
+        ],
+        dim=0,
+    )  # [N]
+
+    visible_views = torch.zeros(
+        n,
+        device=device,
+        dtype=torch.float32,
+    )
+
+    total_area = torch.zeros_like(visible_views)
+    max_size = torch.zeros_like(visible_views)
 
     for camera in cameras:
-        shared_sh = neural_scene.global_sh
-
-        for i, neural_slice in enumerate(neural_scene.slices):
-            layer, info = renderer.render_slice(
-                camera=camera,
-                neural_slice=neural_slice,
-                shared_sh=shared_sh,
-            )
-
-            alpha = layer[:, 3:4]
-
-            max_alpha = float(alpha.max().item())
-            alpha_mass = float(alpha.sum().item())
-            patch_size = float(info["patch_size"].item())
-
-            stats[i]["max_alpha"] = max(
-                stats[i]["max_alpha"],
-                max_alpha,
-            )
-
-            stats[i]["alpha_mass_sum"] += alpha_mass
-            stats[i]["patch_size_sum"] += patch_size
-            stats[i]["num_views"] += 1
-
-            if max_alpha > 0.01:
-                stats[i]["visible_views"] += 1
-
-    for s in stats:
-        n = max(s["num_views"], 1)
-
-        s["mean_alpha_mass"] = (
-            s["alpha_mass_sum"] / n
+        relative = (
+            camera.camera_center[None, :] - centers
         )
 
-        s["mean_patch_size"] = (
-            s["patch_size_sum"] / n
+        radius = torch.linalg.norm(
+            relative,
+            dim=1,
+        ).clamp_min(1e-8)
+
+        ones = torch.ones(
+            n,
+            1,
+            device=device,
+            dtype=dtype,
         )
 
-    return stats
+        points_h = torch.cat(
+            [centers, ones],
+            dim=1,
+        )
 
+        clip = points_h @ camera.full_proj_transform
+        ndc = clip[:, :3] / clip[:, 3:4].clamp_min(1e-8)
+
+        image_w = float(camera.image_width)
+        image_h = float(camera.image_height)
+
+        pixel_x = (
+            (ndc[:, 0] + 1.0)
+            * 0.5
+            * image_w
+        )
+
+        if flip_projection_y:
+            pixel_y = (
+                (ndc[:, 1] + 1.0)
+                * 0.5
+                * image_h
+            )
+        else:
+            pixel_y = (
+                (1.0 - ndc[:, 1])
+                * 0.5
+                * image_h
+            )
+
+        patch_size = (
+            image_h
+            * sizes
+            * float(fno_radius)
+            / radius
+        )
+
+        visible = (
+            (ndc[:, 2] > 0.0)
+            & torch.isfinite(patch_size)
+            & (patch_size >= float(min_patch_size_px))
+            & (pixel_x >= -float(margin_px))
+            & (pixel_x <= image_w + float(margin_px))
+            & (pixel_y >= -float(margin_px))
+            & (pixel_y <= image_h + float(margin_px))
+        )
+
+        visible_f = visible.float()
+
+        visible_views += visible_f
+        total_area += visible_f * patch_size.square()
+        max_size = torch.maximum(
+            max_size,
+            patch_size * visible_f,
+        )
+
+    mean_area = total_area / visible_views.clamp_min(1.0)
+
+    # One CPU transfer for all slices, only at lifecycle intervals.
+    visible_cpu = visible_views.cpu().tolist()
+    mean_area_cpu = mean_area.cpu().tolist()
+    max_size_cpu = max_size.cpu().tolist()
+    opacity_cpu = opacities.cpu().tolist()
+
+    return [
+        {
+            "visible_views": int(visible_cpu[i]),
+            "mean_projected_area": float(mean_area_cpu[i]),
+            "max_projected_size": float(max_size_cpu[i]),
+            "opacity": float(opacity_cpu[i]),
+        }
+        for i in range(n)
+    ]
 
 # ============================================================
 # PRUNING
 # ============================================================
-
-def choose_prune_indices(
-    slice_stats,
-    min_max_alpha=0.01,
-    min_alpha_mass=5.0,
-    min_visible_views=1,
-    min_remaining_slices=1,
-):
-    """
-    Decide which slices are safe to prune.
-
-    Conservative initial rule:
-      prune if a slice is effectively invisible in all views.
-    """
-    candidate_indices = []
-
-    for i, s in enumerate(slice_stats):
-        invisible = (
-            s["max_alpha"] < min_max_alpha
-            or s["mean_alpha_mass"] < min_alpha_mass
-            or s["visible_views"] < min_visible_views
-        )
-
-        if invisible:
-            candidate_indices.append(i)
-
-    max_prunable = max(
-        0,
-        len(slice_stats) - min_remaining_slices,
-    )
-
-    return candidate_indices[:max_prunable]
 
 
 def prune_slices(neural_scene, prune_indices):
@@ -205,65 +239,97 @@ def prune_slices(neural_scene, prune_indices):
     neural_scene.slices = nn.ModuleList(kept)
 
     return kept_old_indices
+    
+
+def choose_batched_prune_candidates(
+    lifecycle_stats,
+    max_candidates=16,
+    min_visible_views=1,
+):
+    """
+    Cheap ranking for possible pruning.
+
+    Does NOT prune directly. It only identifies weak slices for
+    optional expensive contribution testing.
+    """
+    scores = []
+
+    for i, stats in enumerate(lifecycle_stats):
+        if stats["visible_views"] < min_visible_views:
+            score = -1.0
+        else:
+            score = (
+                stats["opacity"]
+                * stats["mean_projected_area"]
+                * stats["visible_views"]
+            )
+
+        scores.append((score, i))
+
+    scores.sort(key=lambda x: x[0])
+
+    return [
+        i
+        for _, i in scores[:max_candidates]
+    ]
 
 
 # ============================================================
 # SPLITTING
 # ============================================================
 
-def score_slices_for_split(
-    slice_stats,
-    gradient_stats,
-    min_alpha_mass=10.0,
-    min_patch_size=40.0,
+def choose_batched_split_candidates(
+    lifecycle_stats,
+    gradient_summary,
+    max_candidates=8,
+    min_visible_views=1,
+    min_projected_area=64.0,
 ):
     """
-    Compute a simple split score.
-
-    High score means:
-      - visible enough to matter
-      - large on screen
-      - high position/size gradient
+    Return high-value split candidates.
     """
-    scores = []
+    scored = []
 
-    for i, s in enumerate(slice_stats):
-        if (
-            s["mean_alpha_mass"] < min_alpha_mass
-            or s["mean_patch_size"] < min_patch_size
-        ):
-            scores.append(float("-inf"))
+    for i, stats in enumerate(lifecycle_stats):
+        if stats["visible_views"] < min_visible_views:
+            continue
+
+        if stats["mean_projected_area"] < min_projected_area:
             continue
 
         grad_score = (
-            gradient_stats["center_grad_norm"][i]
-            + gradient_stats["size_grad_norm"][i]
+            gradient_summary["center_grad_norm"][i]
+            + gradient_summary["size_grad_norm"][i]
         )
 
         score = (
             grad_score
-            * math.sqrt(max(s["mean_alpha_mass"], 1.0))
-            * math.sqrt(max(s["mean_patch_size"], 1.0))
+            * stats["opacity"]
+            * stats["mean_projected_area"]
         )
 
-        scores.append(score)
+        scored.append((score, i))
 
-    return scores
+    scored.sort(reverse=True)
+
+    return [
+        i
+        for _, i in scored[:max_candidates]
+    ]
     
     
 def perturb_child_parameters(
     child,
     ctrl_noise=0.05,
     sigma_noise=0.10,
-    hue_noise=0.02,
+    color_noise=0.05,
     opacity_noise=0.05,
     roughness_noise=0.05,
 ):
     """
-    Add small noise in RAW parameter space after a split.
+    Slightly perturb child raw parameters after splitting.
 
-    This breaks child symmetry while preserving the parent's
-    overall appearance/shape.
+    Uses RGB material fields, not old hue/saturation fields.
     """
     with torch.no_grad():
         child.raw_ctrl.add_(
@@ -274,22 +340,35 @@ def perturb_child_parameters(
             sigma_noise * torch.randn_like(child.raw_sigma)
         )
 
-        child.raw_hue.add_(
-            hue_noise * torch.randn_like(child.raw_hue)
+        child.raw_base_color_r.add_(
+            color_noise * torch.randn_like(
+                child.raw_base_color_r
+            )
         )
 
-        child.raw_saturation.add_(
-            0.05 * torch.randn_like(child.raw_saturation)
+        child.raw_base_color_g.add_(
+            color_noise * torch.randn_like(
+                child.raw_base_color_g
+            )
+        )
+
+        child.raw_base_color_b.add_(
+            color_noise * torch.randn_like(
+                child.raw_base_color_b
+            )
         )
 
         child.raw_opacity.add_(
-            opacity_noise * torch.randn_like(child.raw_opacity)
+            opacity_noise * torch.randn_like(
+                child.raw_opacity
+            )
         )
 
         if child.mode == "surface":
             child.raw_roughness.add_(
-                roughness_noise
-                * torch.randn_like(child.raw_roughness)
+                roughness_noise * torch.randn_like(
+                    child.raw_roughness
+                )
             )
 
         if child.optimize_environment:
@@ -394,67 +473,79 @@ def split_slice(
 
 def split_top_slices(
     neural_scene,
-    slice_stats,
+    candidate_indices,
     gradient_stats,
     max_splits=1,
-    max_total_slices=64,
-    min_alpha_mass=10.0,
-    min_patch_size=40.0,
+    max_total_slices=None,
     mode_selector=None,
 ):
     """
-    Split highest-scoring parent slices.
+    Split preselected slice indices.
 
-    Each selected parent is replaced by two children.
-    Every non-selected slice is preserved.
+    candidate_indices should be ranked from strongest split
+    candidate to weakest. These normally come from batched
+    lifecycle statistics.
 
-    Returns:
-        selected: list of original parent indices that were split.
+    Each split replaces one parent with two children, therefore
+    each split adds one net slice.
     """
     old_slices = list(neural_scene.slices)
-    num_old_slices = len(old_slices)
+    old_count = len(old_slices)
 
-    if num_old_slices == 0:
+    if old_count == 0:
         return []
 
-    if num_old_slices >= max_total_slices:
+    if (
+        max_total_slices is not None
+        and max_total_slices > 0
+        and old_count >= max_total_slices
+    ):
         return []
 
-    scores = score_slices_for_split(
-        slice_stats=slice_stats,
-        gradient_stats=gradient_stats,
-        min_alpha_mass=min_alpha_mass,
-        min_patch_size=min_patch_size,
-    )
+    if not candidate_indices:
+        return []
 
-    ranked_indices = sorted(
-        range(len(scores)),
-        key=lambda index: scores[index],
-        reverse=True,
-    )
+    if max_total_slices is None or max_total_slices <= 0:
+        available_splits = int(max_splits)
+    else:
+        available_splits = min(
+            int(max_splits),
+            int(max_total_slices) - old_count,
+        )
 
-    # Each parent replaced by two children adds one net slice.
-    available_splits = max_total_slices - num_old_slices
-    num_to_select = min(
-        int(max_splits),
-        available_splits,
-    )
+    if available_splits <= 0:
+        return []
 
+    # Keep valid, unique candidate indices only.
     selected = []
 
-    for index in ranked_indices:
-        if len(selected) >= num_to_select:
-            break
+    for index in candidate_indices:
+        index = int(index)
 
-        score = scores[index]
-
-        if not math.isfinite(score):
+        if index < 0 or index >= old_count:
             continue
 
-        if score <= 0.0:
+        if index in selected:
             continue
+
+        # Optional sanity: do not split completely inactive
+        # gradients if gradient statistics are available.
+        if gradient_stats is not None:
+            center_grad = gradient_stats[
+                "center_grad_norm"
+            ][index]
+
+            size_grad = gradient_stats[
+                "size_grad_norm"
+            ][index]
+
+            if center_grad <= 0.0 and size_grad <= 0.0:
+                continue
 
         selected.append(index)
+
+        if len(selected) >= available_splits:
+            break
 
     if not selected:
         return []
@@ -463,52 +554,50 @@ def split_top_slices(
 
     print(
         "[split_top_slices] "
-        f"old_count={num_old_slices}, "
+        f"old_count={old_count}, "
         f"selected={sorted(selected_set)}"
     )
 
     new_slices = []
 
-    # IMPORTANT:
-    # This loop preserves every non-selected old slice.
     for parent_index, parent in enumerate(old_slices):
         if parent_index not in selected_set:
             new_slices.append(parent)
             continue
 
-        # Parent is selected: replace it with two children.
         child_a, child_b = split_slice(parent)
 
         if mode_selector is not None:
-            selected_children = mode_selector(
+            chosen = mode_selector(
                 parent_index=parent_index,
                 child_a=child_a,
                 child_b=child_b,
             )
 
             if (
-                not isinstance(selected_children, tuple)
-                or len(selected_children) != 2
+                not isinstance(chosen, tuple)
+                or len(chosen) != 2
             ):
                 raise RuntimeError(
                     "mode_selector must return "
                     "(child_a, child_b)."
                 )
 
-            child_a, child_b = selected_children
+            child_a, child_b = chosen
 
-        new_slices.append(child_a)
-        new_slices.append(child_b)
+        new_slices.extend([
+            child_a,
+            child_b,
+        ])
 
-    expected_count = num_old_slices + len(selected)
+    expected_count = old_count + len(selected)
 
     if len(new_slices) != expected_count:
         raise RuntimeError(
-            "Split produced wrong number of slices: "
-            f"old={num_old_slices}, "
-            f"num_split={len(selected)}, "
+            f"Split count mismatch: old={old_count}, "
+            f"splits={len(selected)}, "
             f"expected={expected_count}, "
-            f"actual={len(new_slices)}"
+            f"got={len(new_slices)}"
         )
 
     neural_scene.slices = nn.ModuleList(new_slices)
@@ -519,7 +608,6 @@ def split_top_slices(
     )
 
     return selected
-
 
 # ============================================================
 # POINT-CLOUD INITIALIZATION
@@ -564,16 +652,37 @@ def voxel_chunk_seeds(
 
     candidates = []
 
+    # Make sure inverse is a simple [N] vector.
+    inverse = inverse.reshape(-1)
+    counts = counts.reshape(-1)
+
     for voxel_id in range(unique_voxels.shape[0]):
         count = int(counts[voxel_id].item())
 
         if count < min_points:
             continue
 
-        points = xyz[inverse == voxel_id]
+        # Explicit indices are safer than direct boolean indexing.
+        point_indices = torch.nonzero(
+            inverse == voxel_id,
+            as_tuple=True,
+        )[0]
+
+        # Defensive guard: should agree with `count`, but avoid crash.
+        if point_indices.numel() == 0:
+            print(
+                f"[WARN] voxel_id={voxel_id} has count={count} "
+                "but no selected points; skipping."
+            )
+            continue
+
+        points = xyz.index_select(
+            0,
+            point_indices,
+        )
 
         center = points.median(
-            dim=0
+            dim=0,
         ).values
 
         candidates.append(
@@ -602,34 +711,62 @@ def voxel_chunk_seeds(
 
 def serialize_slice(neural_slice):
     """
-    Store enough information to reconstruct one slice object.
+    Store RGB-conditioned slice construction metadata.
+
+    State dict still stores exact raw parameters/buffers, but this
+    metadata is useful for inspecting/reconstructing topology.
     """
     values = neural_slice.fno_values()
 
     return {
         "mode": neural_slice.mode,
+
         "center": neural_slice.center.detach().cpu(),
-        "world_size": float(neural_slice.world_size.detach().cpu()),
+
+        "world_size": float(
+            neural_slice.world_size.detach().cpu()
+        ),
 
         "ctrl_values": values["ctrl"].detach().cpu(),
-        "sigma": float(values["sigma"].detach().cpu()),
 
-        "hue": float(values["hue"].detach().cpu()),
-        "saturation": float(values["saturation"].detach().cpu()),
-        "opacity": float(values["opacity"].detach().cpu()),
-        "roughness": float(values["roughness"].detach().cpu()),
+        "sigma": float(
+            values["sigma"].detach().cpu()
+        ),
+
+        "base_color_r": float(
+            values["base_color_r"].detach().cpu()
+        ),
+
+        "base_color_g": float(
+            values["base_color_g"].detach().cpu()
+        ),
+
+        "base_color_b": float(
+            values["base_color_b"].detach().cpu()
+        ),
+
+        "opacity": float(
+            values["opacity"].detach().cpu()
+        ),
+
+        "roughness": float(
+            values["roughness"].detach().cpu()
+        ),
 
         "metallic": float(
             neural_slice.metallic_value.detach().cpu()
         ),
+
         "specular": float(
             neural_slice.specular_value.detach().cpu()
         ),
 
         "sh_values": neural_slice.initial_sh.detach().cpu(),
+
         "optimize_environment": bool(
             neural_slice.optimize_environment
         ),
+
         "local_sh_bound": float(
             neural_slice.local_sh_bound
         ),

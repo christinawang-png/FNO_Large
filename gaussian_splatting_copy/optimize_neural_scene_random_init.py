@@ -15,6 +15,8 @@ import torch.nn.functional as F
 
 import random
 
+from torch.utils.checkpoint import checkpoint
+
 
 # ============================================================
 # PATH SETUP
@@ -45,15 +47,19 @@ from neural_lifecycle import (
     make_gradient_stats,
     accumulate_gradient_stats,
     finalize_gradient_stats,
-    collect_slice_statistics,
     prune_slices,
     split_top_slices,
     voxel_chunk_seeds,
+    collect_batched_lifecycle_stats,
+    choose_batched_prune_candidates,
+    choose_batched_split_candidates,
 )
 
 from tiled_roi_renderer import (
     render_rois_to_tiled_canvas,
 )
+
+from tile_patch_renderer import TilePatchRenderer
 
 
 # ============================================================
@@ -61,11 +67,11 @@ from tiled_roi_renderer import (
 # ============================================================
 
 SURFACE_CHECKPOINT = (
-    FNO_ROOT / "fno_premult_surface_final.pt"
+    FNO_ROOT / "fno_premult_surface_epoch128_color.pt"
 )
 
 VOLUME_CHECKPOINT = (
-    FNO_ROOT / "fno_premult_volume_epoch025.pt"
+    FNO_ROOT / "fno_premult_volume_epoch016_color.pt"
 )
 
 DEFAULT_OUTPUT_DIR = (
@@ -104,11 +110,11 @@ NEIGHBOR_SH_REG_WEIGHT = 1e-1
 MAX_GRAD_NORM = 1.0
 
 # Optimization schedule.
-SHAPE_WARMUP_ITERS = 500
-LIGHTING_START_ITERS = 1000
+SHAPE_WARMUP_ITERS = 300
+LIGHTING_START_ITERS = 500
 
 # Early stage: shape/material adapt fast.
-EARLY_PLACEMENT_LR = 1e-2
+EARLY_PLACEMENT_LR = 1e-3
 EARLY_SHAPE_LR = 5e-2
 EARLY_MATERIAL_LR = 7e-2
 
@@ -120,14 +126,11 @@ MID_MATERIAL_LR = 2e-3
 # Final stage: mostly refine appearance/light.
 LATE_PLACEMENT_LR = 1e-4
 LATE_SHAPE_LR = 5e-4
-LATE_MATERIAL_LR = 5e-4
+LATE_MATERIAL_LR = 2e-3
 
 # Lighting is deliberately very slow.
-LOCAL_SH_LR = 1e-7
-GLOBAL_SH_LR = 1e-8
-
-# Local patch rendering. Avoid full HxW layer per slice.
-USE_LOCAL_ROI_RENDERING = True
+LOCAL_SH_LR = 1e-4
+GLOBAL_SH_LR = 1e-3
 
 
 # ============================================================
@@ -317,16 +320,20 @@ def random_slice_init(rng, shared_sh):
             rng.choice(SIGMA_VALUES)
         ),
 
-        "hue": float(
-            rng.uniform(0.0, 1.0)
+        "base_color_r": float(
+            rng.uniform(0.02, 1.0)
         ),
-
-        "saturation": float(
-            rng.uniform(0.3, 0.9)
+        
+        "base_color_g": float(
+            rng.uniform(0.02, 1.0)
+        ),
+        
+        "base_color_b": float(
+            rng.uniform(0.02, 1.0)
         ),
 
         "opacity": float(
-            rng.uniform(0.1, 1.0)
+            0.9
         ),
 
         "roughness": float(
@@ -369,8 +376,9 @@ def make_slice_from_seed(
         world_size=float(seed["world_size"]),
         ctrl_values=init_params["ctrl_values"],
         sigma=init_params["sigma"],
-        hue=init_params["hue"],
-        saturation=init_params["saturation"],
+        base_color_r =init_params["base_color_r"],
+        base_color_g =init_params["base_color_g"],
+        base_color_b =init_params["base_color_b"],
         opacity=init_params["opacity"],
         roughness=roughness,
         sh_values=init_params["sh_values"],
@@ -657,34 +665,193 @@ def run_fno_in_chunks(
     model,
     params,
     batch_size,
+    use_activation_checkpointing=True,
 ):
     """
-    params: [N,D]
-    returns: [N,4,64,64]
+    params:
+        [N, latent_dim]
+
+    returns:
+        [N, 4, 64, 64]
+
+    With activation checkpointing enabled, FNO activations are
+    discarded during forward and recomputed during backward.
     """
     if params.shape[0] == 0:
-        raise RuntimeError("Cannot run FNO on empty batch.")
+        raise RuntimeError("Cannot run FNO on an empty batch.")
 
     outputs = []
 
-    for start in range(
-        0,
-        params.shape[0],
-        batch_size,
-    ):
-        end = min(
-            start + batch_size,
-            params.shape[0],
+    for start in range(0, params.shape[0], batch_size):
+        end = min(start + batch_size, params.shape[0])
+
+        param_chunk = params[start:end]
+
+        if (
+            use_activation_checkpointing
+            and torch.is_grad_enabled()
+        ):
+            output_chunk = checkpoint(
+                model,
+                param_chunk,
+                use_reentrant=False,
+            )
+        else:
+            output_chunk = model(param_chunk)
+
+        outputs.append(output_chunk)
+
+    return torch.cat(outputs, dim=0)
+    
+
+@torch.no_grad()
+def select_visible_slice_indices_batched(
+    camera,
+    slices,
+    fno_radius,
+    min_patch_size_px=2.0,
+    margin_px=64.0,
+    flip_projection_y=False,
+    max_active_slices=0,
+):
+    """
+    Batched equivalent of is_slice_potentially_visible().
+
+    Returns:
+        active_indices: 1D LongTensor on GPU, indexing `slices`.
+
+    Visibility decisions are discrete/non-differentiable, which is
+    acceptable for culling. The actual render of selected slices
+    remains differentiable.
+    """
+    n = len(slices)
+
+    if n == 0:
+        return torch.empty(
+            0,
+            dtype=torch.long,
+            device=camera.camera_center.device,
         )
 
-        outputs.append(
-            model(params[start:end])
-        )
+    device = camera.camera_center.device
+    dtype = camera.camera_center.dtype
 
-    return torch.cat(
-        outputs,
+    # [N,3]
+    centers = torch.stack(
+        [
+            s.center.detach().to(
+                device=device,
+                dtype=dtype,
+            )
+            for s in slices
+        ],
         dim=0,
     )
+
+    # [N]
+    world_sizes = torch.stack(
+        [
+            s.world_size.detach().to(
+                device=device,
+                dtype=dtype,
+            )
+            for s in slices
+        ],
+        dim=0,
+    )
+
+    # Camera-relative distance.
+    relative = camera.camera_center[None, :] - centers
+
+    radii = torch.linalg.norm(
+        relative,
+        dim=1,
+    ).clamp_min(1e-8)
+
+    # Project every slice center at once.
+    ones = torch.ones(
+        n,
+        1,
+        device=device,
+        dtype=dtype,
+    )
+
+    points_h = torch.cat(
+        [centers, ones],
+        dim=1,
+    )  # [N,4]
+
+    # 3DGS uses row-vector convention.
+    clip = points_h @ camera.full_proj_transform
+
+    clip_w = clip[:, 3].clamp_min(1e-8)
+    ndc = clip[:, :3] / clip_w[:, None]
+
+    image_w = float(camera.image_width)
+    image_h = float(camera.image_height)
+
+    pixel_x = (
+        (ndc[:, 0] + 1.0)
+        * 0.5
+        * image_w
+    )
+
+    if flip_projection_y:
+        pixel_y = (
+            (ndc[:, 1] + 1.0)
+            * 0.5
+            * image_h
+        )
+    else:
+        pixel_y = (
+            (1.0 - ndc[:, 1])
+            * 0.5
+            * image_h
+        )
+
+    # Same uniform patch-size approximation used by rendering.
+    patch_size = (
+        image_h
+        * world_sizes
+        * float(fno_radius)
+        / radii
+    )
+
+    # Keep your previous visibility convention: ndc z > 0.
+    active_mask = (
+        (ndc[:, 2] > 0.0)
+        & torch.isfinite(pixel_x)
+        & torch.isfinite(pixel_y)
+        & torch.isfinite(patch_size)
+        & (patch_size >= float(min_patch_size_px))
+        & (pixel_x >= -float(margin_px))
+        & (pixel_x <= image_w + float(margin_px))
+        & (pixel_y >= -float(margin_px))
+        & (pixel_y <= image_h + float(margin_px))
+    )
+
+    active_indices = torch.nonzero(
+        active_mask,
+        as_tuple=True,
+    )[0]
+
+    # Optional cap: preserve the largest projected patches.
+    if (
+        max_active_slices > 0
+        and active_indices.numel() > max_active_slices
+    ):
+        scores = patch_size[active_indices] ** 2
+
+        _, local_indices = torch.topk(
+            scores,
+            k=max_active_slices,
+            largest=True,
+            sorted=False,
+        )
+
+        active_indices = active_indices[local_indices]
+
+    return active_indices
 
 
 # ============================================================
@@ -705,7 +872,15 @@ class NeuralSceneRenderer(nn.Module):
         placement_batch_size=8,
         flip_projection_y=False,
         flip_fno_vertical=False,
+        use_tile_renderer=False,
         use_visibility_culling=False,
+        tile_size=128,
+        tile_roi_margin=16,
+        max_patches_per_tile=None,
+        use_fno_activation_checkpointing=True,
+        max_active_slices_per_camera=0,
+        min_projected_patch_size=2.0,
+        active_slice_margin=64.0,
     ):
         super().__init__()
 
@@ -732,6 +907,32 @@ class NeuralSceneRenderer(nn.Module):
         )
         self.use_visibility_culling = bool(
             use_visibility_culling
+        )
+        
+        self.use_tile_renderer = bool(
+            use_tile_renderer
+        )
+
+        self.tile_renderer = TilePatchRenderer(
+            tile_size=int(tile_size),
+            roi_margin=int(tile_roi_margin),
+            max_patches_per_tile=max_patches_per_tile,
+        )
+        
+        self.use_fno_activation_checkpointing = bool(
+            use_fno_activation_checkpointing
+        )
+        
+        self.max_active_slices_per_camera = int(
+            max_active_slices_per_camera
+        )
+        
+        self.min_projected_patch_size = float(
+            min_projected_patch_size
+        )
+        
+        self.active_slice_margin = float(
+            active_slice_margin
         )
 
         for model in [
@@ -830,18 +1031,25 @@ class NeuralSceneRenderer(nn.Module):
     ):
         
         if self.use_visibility_culling:
+            active_indices = select_visible_slice_indices_batched(
+                camera=camera,
+                slices=slices,
+                fno_radius=self.fno_radius,
+                min_patch_size_px=self.min_projected_patch_size,
+                margin_px=self.active_slice_margin,
+                flip_projection_y=self.flip_projection_y,
+                max_active_slices=self.max_active_slices_per_camera,
+            )
+        
+            # Only one small GPU -> CPU transfer for selected indices.
+            active_indices_cpu = active_indices.detach().cpu().tolist()
+        
             active_slices = [
-                s for s in slices
-                if is_slice_potentially_visible(
-                    camera=camera,
-                    neural_slice=s,
-                    fno_radius=self.fno_radius,
-                    margin_px=64.0,
-                    min_patch_size_px=2.0,
-                    flip_projection_y=self.flip_projection_y,
-                )
+                slices[i]
+                for i in active_indices_cpu
             ]
         else:
+            active_indices_cpu = list(range(len(slices)))
             active_slices = list(slices)
         
         if len(active_slices) == 0:
@@ -855,6 +1063,18 @@ class NeuralSceneRenderer(nn.Module):
                     dtype=torch.float32,
                 ),
                 [],
+            )
+            
+        if not hasattr(self, "_active_slice_print_count"):
+            self._active_slice_print_count = 0
+        
+        self._active_slice_print_count += 1
+        
+        if self._active_slice_print_count % 100 == 1:
+            print(
+                f"[ACTIVE SLICES] "
+                f"{len(active_slices)} / {len(slices)} "
+                f"for camera={camera.image_name}"
             )
         
         slices = active_slices
@@ -887,7 +1107,8 @@ class NeuralSceneRenderer(nn.Module):
         # ----------------------------------------------------
         # Phase A: build per-slice tensor records.
         # ----------------------------------------------------
-        for slice_index, neural_slice in enumerate(slices):
+        for local_index, neural_slice in enumerate(active_slices):
+            slice_index = active_indices_cpu[local_index]
             phi, theta, actual_radius, relative = (
                 camera_to_slice_pose(
                     camera,
@@ -976,9 +1197,12 @@ class NeuralSceneRenderer(nn.Module):
             )
 
             surface_patches = run_fno_in_chunks(
-                self.surface_model,
-                surface_params,
+                model=self.surface_model,
+                params=surface_params,
                 batch_size=self.fno_batch_size,
+                use_activation_checkpointing=(
+                    self.use_fno_activation_checkpointing
+                ),
             )
 
             if self.flip_fno_vertical:
@@ -1006,9 +1230,12 @@ class NeuralSceneRenderer(nn.Module):
             )
 
             volume_patches = run_fno_in_chunks(
-                self.volume_model,
-                volume_params,
+                model=self.volume_model,
+                params=volume_params,
                 batch_size=self.fno_batch_size,
+                use_activation_checkpointing=(
+                    self.use_fno_activation_checkpointing
+                ),
             )
 
             if self.flip_fno_vertical:
@@ -1082,22 +1309,47 @@ class NeuralSceneRenderer(nn.Module):
         sorted_center_y = center_y[sort_indices]
         sorted_patch_sizes = patch_sizes[sort_indices]
 
-        # --------------------------------------------------------
-        # Phase C: local ROI placement and compositing.
+        # ----------------------------------------------------
+        # Phase C: render patch primitives into one tiled output.
         #
-        # sorted_patches are already ordered far -> near.
-        # --------------------------------------------------------
-        composite = render_rois_to_tiled_canvas(
-            sorted_patches=sorted_patches,
-            sorted_center_x=sorted_center_x,
-            sorted_center_y=sorted_center_y,
-            sorted_patch_sizes=sorted_patch_sizes,
-            canvas_height=canvas_h,
-            canvas_width=canvas_w,
-            tile_size=128,
-            margin_pixels=16,
-            max_roi_side=512,
-        )
+        # TilePatchRenderer:
+        #   - bins patches into local screen tiles
+        #   - samples only tile-local patch footprints
+        #   - composites far -> near within each tile
+        #   - allocates the full output image only once
+        # ----------------------------------------------------
+        if self.use_tile_renderer:
+            if not hasattr(self, "_printed_renderer_mode"):
+                print("[RENDERER] Using TilePatchRenderer")
+                self._printed_renderer_mode = True
+        
+            composite = self.tile_renderer(
+                patches=all_patches,
+                center_x=center_x,
+                center_y=center_y,
+                patch_size=patch_sizes,
+                depths=depths,
+                image_height=canvas_h,
+                image_width=canvas_w,
+            )
+        else:
+            if not hasattr(self, "_printed_renderer_mode"):
+                print("[RENDERER] Using reference ROI renderer")
+                self._printed_renderer_mode = True
+            # Keep your existing reference ROI renderer here.
+            #
+            # Example:
+            composite = render_rois_to_tiled_canvas(
+                sorted_patches=sorted_patches,
+                sorted_center_x=sorted_center_x,
+                sorted_center_y=sorted_center_y,
+                sorted_patch_sizes=sorted_patch_sizes,
+                canvas_height=canvas_h,
+                canvas_width=canvas_w,
+                tile_size=128,
+                margin_pixels=16,
+                max_roi_side=512,
+            )
 
         diagnostics = []
 
@@ -1238,12 +1490,15 @@ def parameter_regularization(neural_scene):
         ) ** 2
 
         appearance_loss = appearance_loss + (
-            values["hue"] - s.initial_hue
+            values["base_color_r"] - s.initial_base_color_r
         ) ** 2
-
+        
         appearance_loss = appearance_loss + (
-            values["saturation"]
-            - s.initial_saturation
+            values["base_color_g"] - s.initial_base_color_g
+        ) ** 2
+        
+        appearance_loss = appearance_loss + (
+            values["base_color_b"] - s.initial_base_color_b
         ) ** 2
 
         appearance_loss = appearance_loss + (
@@ -1388,8 +1643,9 @@ def make_optimizer(
         ])
 
         material_params.extend([
-            s.raw_hue,
-            s.raw_saturation,
+            s.raw_base_color_r,
+            s.raw_base_color_g,
+            s.raw_base_color_b,
             s.raw_opacity,
             s.raw_roughness,
         ])
@@ -1481,6 +1737,10 @@ def evaluate_scene_loss(
             camera,
             neural_scene,
         )
+        
+        if not predicted_rgba.requires_grad:
+            # No active slices for this camera.
+            continue
 
         target = camera.original_image
 
@@ -1797,26 +2057,12 @@ def choose_contribution_prune_indices(
     renderer,
     neural_scene,
     cameras,
-    slice_stats,
-    max_candidates=4,
+    candidate_indices,
     max_prunes=2,
     contribution_threshold=1e-4,
 ):
     if len(neural_scene.slices) <= 1:
         return []
-
-    weak_order = sorted(
-        range(len(slice_stats)),
-        key=lambda i: (
-            slice_stats[i]["mean_alpha_mass"],
-            slice_stats[i]["max_alpha"],
-            slice_stats[i]["visible_views"],
-        ),
-    )
-
-    candidate_indices = weak_order[
-        :min(max_candidates, len(weak_order))
-    ]
 
     full_loss = mean_scene_loss(
         renderer=renderer,
@@ -1946,12 +2192,16 @@ def rebuild_neural_scene_from_checkpoint(
             prefix + "initial_sigma"
         ]
 
-        initial_hue = scene_state[
-            prefix + "initial_hue"
+        initial_base_color_r = scene_state[
+            prefix + "initial_base_color_r"
         ]
-
-        initial_saturation = scene_state[
-            prefix + "initial_saturation"
+        
+        initial_base_color_g = scene_state[
+            prefix + "initial_base_color_g"
+        ]
+        
+        initial_base_color_b = scene_state[
+            prefix + "initial_base_color_b"
         ]
 
         initial_opacity = scene_state[
@@ -1980,8 +2230,9 @@ def rebuild_neural_scene_from_checkpoint(
             world_size=float(initial_world_size),
             ctrl_values=initial_ctrl,
             sigma=float(initial_sigma),
-            hue=float(initial_hue),
-            saturation=float(initial_saturation),
+            base_color_r=float(initial_base_color_r),
+            base_color_g=float(initial_base_color_g),
+            base_color_b=float(initial_base_color_b),
             opacity=float(initial_opacity),
             roughness=float(initial_roughness),
             sh_values=initial_sh,
@@ -2387,7 +2638,7 @@ def main():
     parser.add_argument(
         "--contribution_prune_candidates",
         type=int,
-        default=4,
+        default=100,
     )
 
     parser.add_argument(
@@ -2478,8 +2729,87 @@ def main():
     parser.add_argument(
         "--cameras_per_step",
         type=int,
-        default=2,
+        default=10,
         help="Number of cameras randomly used per optimization step.",
+    )
+    
+    parser.add_argument(
+        "--use_tile_renderer",
+        action="store_true",
+        help=(
+            "Use the tile-binned patch renderer instead of the "
+            "older ROI/full-canvas placement path."
+        ),
+    )
+    
+    parser.add_argument(
+        "--tile_size",
+        type=int,
+        default=128,
+        help="Screen tile size for tile-binned patch rendering.",
+    )
+    
+    parser.add_argument(
+        "--tile_roi_margin",
+        type=int,
+        default=16,
+        help="Extra ROI margin in pixels for tile assignment.",
+    )
+    
+    parser.add_argument(
+        "--max_patches_per_tile",
+        type=int,
+        default=0,
+        help=(
+            "Optional safety cap on patches per tile. "
+            "Use 0 for no cap."
+        ),
+    )
+    
+    parser.add_argument(
+        "--disable_fno_activation_checkpointing",
+        action="store_true",
+        help=(
+            "Disable FNO activation checkpointing. "
+            "Faster, but uses more GPU memory."
+        ),
+    )
+    
+    parser.add_argument(
+        "--min_projected_patch_size",
+        type=float,
+        default=2.0,
+    )
+    
+    parser.add_argument(
+        "--active_slice_margin",
+        type=float,
+        default=64.0,
+    )
+    
+    parser.add_argument(
+        "--max_active_slices_per_camera",
+        type=int,
+        default=0,
+        help="Use 0 for no top-K cap after visibility culling.",
+    )
+    
+    parser.add_argument(
+        "--lifecycle_cameras",
+        type=int,
+        default=1,
+    )
+    
+    parser.add_argument(
+        "--lifecycle_prune_candidates",
+        type=int,
+        default=100,
+    )
+    
+    parser.add_argument(
+        "--lifecycle_split_candidates",
+        type=int,
+        default=100,
     )
 
     args = parser.parse_args()
@@ -2522,12 +2852,24 @@ def main():
         )
     )
 
-    if surface_dim != 44 or volume_dim != 44:
+    if surface_dim != volume_dim:
         raise RuntimeError(
-            f"Expected latent_dim=44, got "
-            f"surface={surface_dim}, volume={volume_dim}"
+            f"Surface/volume latent mismatch: "
+            f"{surface_dim} vs {volume_dim}"
+        )
+    
+    if surface_dim != 45:
+        raise RuntimeError(
+            f"Expected RGB-conditioned latent_dim=45, "
+            f"got {surface_dim}"
         )
 
+    max_patches_per_tile = (
+        None
+        if args.max_patches_per_tile <= 0
+        else args.max_patches_per_tile
+    )
+    
     renderer = NeuralSceneRenderer(
         surface_model=surface_model,
         volume_model=volume_model,
@@ -2540,6 +2882,17 @@ def main():
         placement_batch_size=args.placement_batch_size,
         flip_projection_y=args.flip_projection_y,
         flip_fno_vertical=args.flip_fno_vertical,
+        use_tile_renderer=args.use_tile_renderer,
+        tile_size=args.tile_size,
+        tile_roi_margin=args.tile_roi_margin,
+        max_patches_per_tile=max_patches_per_tile,
+        use_visibility_culling=args.use_visibility_culling,
+        use_fno_activation_checkpointing=(
+            not args.disable_fno_activation_checkpointing
+        ),
+        min_projected_patch_size=args.min_projected_patch_size,
+        active_slice_margin=args.active_slice_margin,
+        max_active_slices_per_camera=args.max_active_slices_per_camera,
     ).to(device)
 
     # --------------------------------------------------------
@@ -2561,18 +2914,16 @@ def main():
         args.sh_degree,
     )
 
+    # args.resolution is already applied inside camera_utils.loadCam().
+    # Keep Scene's multiresolution scale fixed at 1.0.
     scene = Scene(
         scene_args,
         gaussian_model,
         shuffle=False,
-        resolution_scales=[
-            float(args.resolution)
-        ],
+        resolution_scales=[1.0],
     )
-
-    cameras = scene.getTrainCameras(
-        scale=float(args.resolution)
-    )
+    
+    cameras = scene.getTrainCameras(scale=1.0)
 
     camera_end = min(
         args.camera_start + args.num_cameras,
@@ -2889,6 +3240,20 @@ def main():
             print(
                 "[LIGHTING] Enabled global SH optimization."
             )
+            
+            for group_index, group in enumerate(optimizer.param_groups):
+                lr = group["lr"]
+        
+                contains_global_sh = any(
+                    p is neural_scene.lighting.raw_global_sh_delta
+                    for p in group["params"]
+                )
+        
+                if contains_global_sh:
+                    print(
+                        f"[LIGHT DEBUG] global SH optimizer group="
+                        f"{group_index}, lr={lr:.3e}"
+                    )
 
         optimizer.zero_grad(set_to_none=True)
 
@@ -2917,6 +3282,9 @@ def main():
             for i in selected_camera_indices
         ]
         
+        if iteration == 0:
+            torch.cuda.reset_peak_memory_stats()
+            
         for camera in step_cameras:
             predicted_rgba, _ = renderer(
                 camera,
@@ -3078,10 +3446,20 @@ def main():
                 gradient_stats
             )
 
-            slice_stats = collect_slice_statistics(
-                renderer=renderer,
+            lifecycle_cameras = cameras_used[
+                :min(
+                    args.lifecycle_cameras,
+                    len(cameras_used),
+                )
+            ]
+            
+            slice_stats = collect_batched_lifecycle_stats(
+                cameras=lifecycle_cameras,
                 neural_scene=neural_scene,
-                cameras=cameras_used,
+                fno_radius=FNO_RADIUS,
+                min_patch_size_px=args.min_projected_patch_size,
+                margin_px=args.active_slice_margin,
+                flip_projection_y=args.flip_projection_y,
             )
 
             print("\n[STRUCTURE UPDATE]")
@@ -3097,21 +3475,21 @@ def main():
                         len(cameras_used),
                     )
                 ]
-
-                prune_indices = (
-                    choose_contribution_prune_indices(
-                        renderer=renderer,
-                        neural_scene=neural_scene,
-                        cameras=prune_cameras,
-                        slice_stats=slice_stats,
-                        max_candidates=(
-                            args.contribution_prune_candidates
-                        ),
-                        max_prunes=args.max_prunes_per_update,
-                        contribution_threshold=(
-                            args.contribution_threshold
-                        ),
-                    )
+                
+                prune_candidates = choose_batched_prune_candidates(
+                    lifecycle_stats=slice_stats,
+                    max_candidates=(
+                        args.lifecycle_prune_candidates
+                    ),
+                )
+                
+                prune_indices = choose_contribution_prune_indices(
+                    renderer=renderer,
+                    neural_scene=neural_scene,
+                    cameras=prune_cameras,
+                    candidate_indices=prune_candidates,
+                    max_prunes=args.max_prunes_per_update,
+                    contribution_threshold=args.contribution_threshold,
                 )
 
                 if prune_indices:
@@ -3129,14 +3507,26 @@ def main():
                     do_split = False
 
             if do_split:
+                
+                max_total_slices = (
+                    None
+                    if args.max_slices <= 0
+                    else args.max_slices
+                )
+                
+                split_candidates = choose_batched_split_candidates(
+                    lifecycle_stats=slice_stats,
+                    gradient_summary=gradient_summary,
+                    max_candidates=args.lifecycle_split_candidates,
+                )
+                
+                # Modify split_top_slices to accept `candidate_indices`.
                 split_indices = split_top_slices(
                     neural_scene=neural_scene,
-                    slice_stats=slice_stats,
+                    candidate_indices=split_candidates,
                     gradient_stats=gradient_summary,
                     max_splits=args.max_splits_per_update,
-                    max_total_slices=args.max_slices,
-                    min_alpha_mass=10.0,
-                    min_patch_size=40.0,
+                    max_total_slices = max_total_slices,
                     mode_selector=split_mode_selector,
                 )
 
@@ -3258,21 +3648,39 @@ def main():
                 .max()
                 .item(),
             )
-
-            for i, s in enumerate(
-                neural_scene.slices
-            ):
-                values = s.fno_values(
-                    shared_sh=neural_scene.global_sh
+            
+        if (
+            args.optimize_sh
+            and current_stage == "lighting"
+            and iteration % 10 == 0
+        ):
+            for i, s in enumerate(neural_scene.slices[:8]):
+                local_grad_norm = (
+                    s.raw_local_sh_delta.grad.detach().norm().item()
+                    if s.raw_local_sh_delta.grad is not None
+                    else None
                 )
-
+        
                 print(
-                    f"  slice={i:03d} "
-                    f"mode={s.mode} "
-                    f"size={s.world_size.item():.4f} "
-                    f"sigma={values['sigma'].item():.4f} "
-                    f"opacity={values['opacity'].item():.4f} "
-                    f"hue={values['hue'].item():.4f}"
+                    f"[LIGHT DEBUG] slice={i:03d} "
+                    f"local_requires_grad={s.raw_local_sh_delta.requires_grad} "
+                    f"local_grad_norm={local_grad_norm}"
+                )
+            
+            if iteration == 0:
+                peak_gib = (
+                    torch.cuda.max_memory_allocated()
+                    / (1024 ** 3)
+                )
+            
+                reserved_gib = (
+                    torch.cuda.max_memory_reserved()
+                    / (1024 ** 3)
+                )
+            
+                print(
+                    f"[MEMORY] peak_allocated={peak_gib:.3f} GiB "
+                    f"peak_reserved={reserved_gib:.3f} GiB"
                 )
 
     # --------------------------------------------------------
@@ -3340,17 +3748,22 @@ def main():
             + 0.5
         ).astype(np.uint8),
     )
+    
+    final_iteration = max(
+        start_iteration,
+        args.iterations - 1,
+    )
 
     # Save final checkpoint too.
     final_checkpoint = output_dir / (
-        f"checkpoint_iter_{args.iterations:06d}_final.pt"
+        f"checkpoint_iter_{final_iteration:06d}_final.pt"
     )
 
     save_neural_scene_checkpoint(
         path=final_checkpoint,
         neural_scene=neural_scene,
         optimizer=optimizer,
-        iteration=args.iterations,
+        iteration=final_iteration,
         metadata={
             "num_slices": len(neural_scene.slices),
             "initial_env_id": initial_env_id,

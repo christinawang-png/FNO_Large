@@ -100,9 +100,9 @@ def set_camera_from_spherical(cam, radius, phi, theta):
     cam.location.y = y
     cam.location.z = z
 
-def make_material_from_params(hue, saturation, metallic, roughness, specular, opacity):
+def make_material_from_params(rgb, metallic, roughness, specular, opacity):
     # surface: Transparent + Principled, mixed by opacity
-    r, g, b = colorsys.hsv_to_rgb(hue, saturation, 0.4)
+    r, g, b = rgb
     base_color = (r, g, b, 1.0)
 
     mat = bpy.data.materials.new(name="SurfMat")
@@ -138,8 +138,8 @@ def make_material_from_params(hue, saturation, metallic, roughness, specular, op
     material_type = "plastic" if metallic <= 1e-3 else "metal"
     return mat, (r, g, b, opacity), material_type
 
-def make_volume_material_from_params(hue, saturation, density_scale):
-    r, g, b = colorsys.hsv_to_rgb(hue, saturation, 0.5)
+def make_volume_material_from_params(rgb, density_scale):
+    r, g, b = rgb
     color = (r, g, b, 1.0)
 
     mat = bpy.data.materials.new(name="VolMat")
@@ -169,7 +169,7 @@ def make_volume_material_from_params(hue, saturation, density_scale):
     links.new(mul.outputs["Value"], vol.inputs["Density"])
     links.new(vol.outputs["Volume"], out.inputs["Volume"])
 
-    return mat
+    return mat, (r, g, b, 1.0)
 
 def make_mask_material():
     """
@@ -466,8 +466,7 @@ def main():
             set_camera_from_spherical(cam, radius, phi, theta)
 
             # 2) material + mode
-            hue        = float(rng.uniform(0.0, 1.0))
-            saturation = float(rng.uniform(0.3, 0.9))
+            base_rgb = rng.uniform(0.02, 1.0, size=3)
             metallic   = float(rng.choice([0.0, 1.0]))
             roughness  = float(rng.uniform(0.1, 0.9))
             specular   = 0.5
@@ -517,7 +516,7 @@ def main():
             # assign real materials for main render
             if render_mode == "surface":
                 mat, base_color, material_type = make_material_from_params(
-                    hue, saturation, metallic, roughness, specular, opacity
+                    base_rgb, metallic, roughness, specular, opacity
                 )
                 mesh_obj.data.materials.clear()
                 mesh_obj.data.materials.append(mat)
@@ -526,13 +525,12 @@ def main():
                     vol_obj.hide_render = True
             else:  # volume
                 density_scale = 0.05 + 0.95 * opacity
-                mat = make_volume_material_from_params(hue, saturation, density_scale)
+                mat, base_color = make_volume_material_from_params(base_rgb, density_scale)
                 if vol_obj is not None:
                     vol_obj.data.materials.clear()
                     vol_obj.data.materials.append(mat)
                     vol_obj.hide_render = False
                 material_type = "volume"
-                base_color = (0.0, 0.0, 0.0, 1.0)
                 mesh_obj.hide_render = True
 
             # 4) main render to temp PNG
@@ -572,8 +570,6 @@ def main():
                 "env_id": env_id,
                 "coeff_path": coeff_path,
                 "mesh_path": mesh_path,
-                "hue": float(hue),
-                "saturation": float(saturation),
                 "metallic": float(metallic),
                 "roughness": float(roughness),
                 "specular": float(specular),

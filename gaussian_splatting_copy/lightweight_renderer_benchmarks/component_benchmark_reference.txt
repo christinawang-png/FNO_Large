@@ -1,0 +1,29 @@
+scene_checkpoint: /home/yuanxiuw/FNO_Large/gaussian_splatting_copy/neural_scene_random_init_outputs/checkpoint_iter_000080.pt
+camera: _DSC8874.JPG
+slice_count: 17111
+renderer: reference
+resolution: 317x208
+fno_batch_size: 512
+activation_checkpointing_full_step: True
+
+[record_preparation]
+wall_ms: 7168.430216
+cuda_ms: 7167.833984
+peak_allocated_gib: 1.099811
+
+[fno_forward_only]
+wall_ms: 9219.332583
+cuda_ms: 9219.217773
+peak_allocated_gib: 8.402477
+
+[raster_only]
+wall_ms: 1936.231146
+cuda_ms: 1936.163818
+peak_allocated_gib: 3.193347
+
+[full_forward_backward]
+wall_ms: 156613.420876
+cuda_ms: 156611.859375
+loss: 0.47590190
+peak_allocated_gib: 28.421562
+peak_reserved_gib: 43.679688

@@ -129,16 +129,16 @@ def main():
     model = FNOPlusResNetSingle(latent_dim=latent_dim, img_size=(64, 64)).to(device)
     print(f"Using device: {device}")
 
-    train_loader = DataLoader(train_dataset, batch_size=256, shuffle=True,
+    train_loader = DataLoader(train_dataset, batch_size=512, shuffle=True,
                               num_workers=8, pin_memory=True, persistent_workers=True)
-    val_loader   = DataLoader(val_dataset,   batch_size=256, shuffle=False,
+    val_loader   = DataLoader(val_dataset,   batch_size=512, shuffle=False,
                               num_workers=8, pin_memory=True, persistent_workers=True)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
     
     # ---- optional resume from checkpoint ----
     resume_path = None  # e.g. "fno_premult_surface_epoch020.pt"
-    start_epoch = 25
+    start_epoch = 120
 
     if "--resume" in sys.argv:
         i = sys.argv.index("--resume") + 1
@@ -165,7 +165,7 @@ def main():
     else:
         print(f"[{mode}] No resume checkpoint found or resume_path=None; starting from scratch.")
 
-    num_epochs = 80
+    num_epochs = 150
     for epoch in range(start_epoch, num_epochs):
         model.train()
         total_train = 0.0
@@ -198,11 +198,11 @@ def main():
 
         avg_val = total_val / len(val_dataset)
 
-        if (epoch + 1) % 5 == 0:
+        if (epoch + 1) % 2 == 0:
             print(f"[{mode}] Epoch {epoch+1}/{num_epochs} "
                   f"train_loss={avg_train:.6f} val_loss={avg_val:.6f}")
 
-            ckpt_path = f"fno_premult_{mode}_epoch{epoch+1:03d}.pt"
+            ckpt_path = f"fno_premult_{mode}_epoch{epoch+1:03d}_color.pt"
             torch.save({
                 "epoch": epoch + 1,
                 "model_state": model.state_dict(),
@@ -213,7 +213,7 @@ def main():
             }, ckpt_path)
             print("Saved checkpoint:", ckpt_path)
 
-    out_path = f"fno_premult_{mode}_final.pt"
+    out_path = f"fno_premult_{mode}_color_final.pt"
     torch.save({
         "model_state": model.state_dict(),
         "param_mean": base_dataset.param_mean,

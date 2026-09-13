@@ -281,8 +281,9 @@ class PlaneDatasetParamsToPremultRGBA(Dataset):
         ctrl_vals = [float(shp[c]) for c in self.ctrl_cols]
         sigma     = float(shp["sigma"])
 
-        hue        = float(row["hue"])
-        saturation = float(row["saturation"])
+        base_r = float(row["base_color_r"])
+        base_g = float(row["base_color_g"])
+        base_b = float(row["base_color_b"])
         metallic   = float(row["metallic"])
         roughness  = float(row["roughness"])
         opacity    = float(row["opacity"])
@@ -306,7 +307,7 @@ class PlaneDatasetParamsToPremultRGBA(Dataset):
         scalars = (
             ctrl_vals
             + [sigma]
-            + [hue, saturation, metallic, roughness, opacity, specular]
+            + [base_r, base_g, base_b, metallic, roughness, opacity, specular]
             + [sin_phi, cos_phi, sin_th, cos_th, radius]
         )
 

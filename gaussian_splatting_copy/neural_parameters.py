@@ -21,6 +21,9 @@ OPACITY_HIGH = 1.00
 ROUGHNESS_LOW = 0.10
 ROUGHNESS_HIGH = 0.90
 
+COLOR_LOW = 0.02
+COLOR_HIGH = 1.00
+
 
 def inverse_bounded(value, low, high, eps=0.02):
     """
@@ -62,8 +65,9 @@ class LearnableNeuralSlice(nn.Module):
         world_size,
         ctrl_values,
         sigma,
-        hue,
-        saturation,
+        base_color_r,
+        base_color_g,
+        base_color_b,
         opacity,
         roughness,
         sh_values,
@@ -130,18 +134,27 @@ class LearnableNeuralSlice(nn.Module):
         # ----------------------------------------------------
         # Appearance parameters
         # ----------------------------------------------------
-        self.raw_hue = nn.Parameter(
-            torch.tensor(
-                float(hue),
-                dtype=torch.float32,
+        self.raw_base_color_r = nn.Parameter(
+            inverse_bounded(
+                base_color_r,
+                COLOR_LOW,
+                COLOR_HIGH,
             )
         )
 
-        self.raw_saturation = nn.Parameter(
+        self.raw_base_color_g = nn.Parameter(
             inverse_bounded(
-                saturation,
-                SAT_LOW,
-                SAT_HIGH,
+                base_color_g,
+                COLOR_LOW,
+                COLOR_HIGH,
+            )
+        )
+        
+        self.raw_base_color_b = nn.Parameter(
+            inverse_bounded(
+                base_color_b,
+                COLOR_LOW,
+                COLOR_HIGH,
             )
         )
 
@@ -228,17 +241,25 @@ class LearnableNeuralSlice(nn.Module):
         )
 
         self.register_buffer(
-            "initial_hue",
+            "initial_base_color_r",
             torch.tensor(
-                float(hue),
+                float(base_color_r),
                 dtype=torch.float32,
             ),
         )
-
+        
         self.register_buffer(
-            "initial_saturation",
+            "initial_base_color_g",
             torch.tensor(
-                float(saturation),
+                float(base_color_g),
+                dtype=torch.float32,
+            ),
+        )
+        
+        self.register_buffer(
+            "initial_base_color_b",
+            torch.tensor(
+                float(base_color_b),
                 dtype=torch.float32,
             ),
         )
@@ -306,15 +327,22 @@ class LearnableNeuralSlice(nn.Module):
             SIGMA_HIGH,
         )
 
-        hue = torch.remainder(
-            self.raw_hue.clamp(-100.0, 100.0),
-            1.0,
+        base_color_r = bounded(
+            self.raw_base_color_r,
+            COLOR_LOW,
+            COLOR_HIGH,
         )
-
-        saturation = bounded(
-            self.raw_saturation,
-            SAT_LOW,
-            SAT_HIGH,
+        
+        base_color_g = bounded(
+            self.raw_base_color_g,
+            COLOR_LOW,
+            COLOR_HIGH,
+        )
+        
+        base_color_b = bounded(
+            self.raw_base_color_b,
+            COLOR_LOW,
+            COLOR_HIGH,
         )
 
         opacity = bounded(
@@ -346,8 +374,9 @@ class LearnableNeuralSlice(nn.Module):
         return {
             "ctrl": ctrl,
             "sigma": sigma,
-            "hue": hue,
-            "saturation": saturation,
+            "base_color_r": base_color_r,
+            "base_color_g": base_color_g,
+            "base_color_b": base_color_b,
             "metallic": metallic,
             "roughness": roughness_for_fno,
             "opacity": opacity,
@@ -393,12 +422,15 @@ class LearnableNeuralSlice(nn.Module):
         ) ** 2
 
         loss = loss + 1e-5 * (
-            values["hue"] - self.initial_hue
+            values["base_color_r"] - self.initial_base_color_r
         ) ** 2
-
+        
         loss = loss + 1e-5 * (
-            values["saturation"]
-            - self.initial_saturation
+            values["base_color_g"] - self.initial_base_color_g
+        ) ** 2
+        
+        loss = loss + 1e-5 * (
+            values["base_color_b"] - self.initial_base_color_b
         ) ** 2
 
         loss = loss + 1e-5 * (
@@ -437,8 +469,9 @@ def build_tensor_fno_vector(
 
         ctrl
         sigma
-        hue
-        saturation
+        base_color_r
+        base_color_g
+        base_color_b
         metallic
         roughness
         opacity
@@ -462,8 +495,9 @@ def build_tensor_fno_vector(
 
     scalars.extend([
         values["sigma"],
-        values["hue"],
-        values["saturation"],
+        values["base_color_r"],
+        values["base_color_g"],
+        values["base_color_b"],
         values["metallic"],
         values["roughness"],
         values["opacity"],
