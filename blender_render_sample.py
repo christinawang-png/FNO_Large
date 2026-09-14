@@ -4,7 +4,7 @@ import matplotlib.pyplot as plt
 from pathlib import Path
 
 # ---- paths ----
-base_dir   = Path("plane_dataset_4")
+base_dir   = Path("implicit_bspline_dataset")
 render_dir = base_dir / "renders"
 alpha_dir  = base_dir / "hard_alpha"
 

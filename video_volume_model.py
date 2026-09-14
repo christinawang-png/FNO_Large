@@ -7,321 +7,580 @@ import imageio.v2 as imageio
 import numpy as np
 import torch
 
-from train_premult_single_mode import (
-    PlaneDatasetParamsToPremultRGBA,
-    FNOPlusResNetSingle,
-)
+from train_premult_single_mode import FNOPlusResNetSingle
 
 
 # ============================================================
 # CONFIGURATION
 # ============================================================
 
-BASE_DIR = Path("./plane_dataset_4")
+CHECKPOINT_PATH = Path(
+    "fno_premult_volume_epoch016_color.pt"
+)
 
-RENDERS_DIR = BASE_DIR / "renders"
-ALPHA_DIR = BASE_DIR / "hard_alpha"
-
-IMG_META_CSV = RENDERS_DIR / "metadata_images_all_sharded.csv"
-VOL_META_CSV = BASE_DIR / "metadata_volumes.csv"
-ALPHA_META_CSV = ALPHA_DIR / "metadata_alpha_all.csv"
-
-CHECKPOINT_PATH = Path("fno_premult_volume_epoch025.pt")
-
-OUTPUT_DIR = BASE_DIR / "volume_videos"
+OUTPUT_DIR = Path("volume_videos_rgb")
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-OUTPUT_RGB_VIDEO = OUTPUT_DIR / "volume_interpolation.mp4"
-OUTPUT_ALPHA_VIDEO = OUTPUT_DIR / "volume_interpolation_alpha.mp4"
-OUTPUT_SIDE_BY_SIDE_VIDEO = OUTPUT_DIR / "volume_interpolation_rgb_alpha_vertical.mp4"
+OUTPUT_RGB_VIDEO = (
+    OUTPUT_DIR / "volume_rgb_interpolation.mp4"
+)
+
+OUTPUT_ALPHA_VIDEO = (
+    OUTPUT_DIR / "volume_alpha_interpolation.mp4"
+)
+
+OUTPUT_COMBINED_VIDEO = (
+    OUTPUT_DIR / "volume_rgb_alpha_vertical.mp4"
+)
 
 IMG_SIZE = (64, 64)
 
 NUM_FRAMES = 180
 FPS = 30
 
-# These are indices within the volume-only dataset.
-START_VOLUME_INDEX = 0
-END_VOLUME_INDEX = 1000
+# True: start -> end -> start.
+# False: start -> end.
+LOOP_BACK = True
 
-# Set these to None to use the sigma values from the endpoint rows.
-# Otherwise, explicitly override both endpoint sigmas.
-START_SIGMA = 0.02       # example: 0.02
-END_SIGMA = 0.7         # example: 0.70
+RANDOM_SEED = 123
 
-# Optional endpoint opacity overrides.
-# These control the volume opacity/density input.
-START_OPACITY = 0.8
-END_OPACITY = 0.1
+# Must match the FNO training camera radius.
+FNO_RADIUS = 2.2
 
-# Output background used when converting premultiplied color to RGB.
+# Display background only; model target remains premultiplied RGBA.
 VIDEO_BACKGROUND = np.array(
-    [0.0, 0.0, 0.0],
+    [1.0, 1.0, 1.0],
     dtype=np.float32,
 )
 
-# axis=0 means:
-#   RGB on top
-#   alpha on bottom
+
+# ============================================================
+# TRAINING-RANGE PARAMETER PRIORS
+# ============================================================
+
+CTRL_LEVELS = np.array(
+    [0.1, 0.3, 0.5, 0.7, 0.9],
+    dtype=np.float32,
+)
+
+SIGMA_VALUES = np.array(
+    [0.02, 0.08, 0.20, 0.50, 0.70],
+    dtype=np.float32,
+)
+
+COLOR_LOW = 0.02
+COLOR_HIGH = 1.00
+
+OPACITY_LOW = 0.10
+OPACITY_HIGH = 1.00
+
+NUM_GLOBAL_ENVS = 128
+SH_ORDER = 2
+
+
+# ============================================================
+# OPTIONAL ENDPOINT OVERRIDES
 #
-# axis=1 would place RGB and alpha side by side horizontally.
-SIDE_BY_SIDE_AXIS = 0
+# Set fields to None to use randomly sampled values.
+# ============================================================
+
+START_OVERRIDE = {
+    "ctrl": [0.1, 0.2, 0.2, 0.1],   # low/slightly bent plane
+    "sigma": 0.08,
+    "base_rgb": [0.9, 0.15, 0.10],  # red
+    "opacity": 0.98,
+    "phi": math.radians(120),
+    "theta": math.radians(220),
+    "env_id": 10,
+}
+
+END_OVERRIDE = {
+    "ctrl": [0.55, 0.02, 0.01, 0.02],  # mean = 0.15
+    "sigma": 0.5,
+    "base_rgb": [0.10, 0.35, 0.95],   # blue
+    "opacity": 0.3,
+    "phi": math.radians(120),
+    "theta": math.radians(220),
+    "env_id": 10,
+}
 
 
 # ============================================================
-# HELPERS
+# ENVIRONMENT SH
+# Matches the Blender generation script.
 # ============================================================
 
-def to_numpy(x):
-    if torch.is_tensor(x):
-        return x.detach().cpu().numpy()
-    return np.asarray(x)
+def sh_lm_list(order):
+    pairs = []
 
+    for l in range(order + 1):
+        for m in range(-l, l + 1):
+            pairs.append((l, m))
+
+    return pairs
+
+
+def sh_for_global_env(env_id, order=2):
+    pairs = sh_lm_list(order)
+
+    coeffs = np.zeros(
+        (len(pairs), 3),
+        dtype=np.float32,
+    )
+
+    u = env_id / max(
+        1.0,
+        float(NUM_GLOBAL_ENVS - 1),
+    )
+
+    t = 2.0 * math.pi * u
+
+    r = 0.5 + 0.4 * math.sin(t)
+    g = 0.5 + 0.4 * math.sin(
+        t + 2.0 * math.pi / 3.0
+    )
+    b = 0.5 + 0.4 * math.sin(
+        t + 4.0 * math.pi / 3.0
+    )
+
+    rgb = np.array(
+        [r, g, b],
+        dtype=np.float32,
+    )
+
+    gray = np.full(
+        3,
+        rgb.mean(),
+        dtype=np.float32,
+    )
+
+    if u < 1.0 / 3.0:
+        color_mix = 0.1
+    elif u < 2.0 / 3.0:
+        color_mix = 0.5
+    else:
+        color_mix = 1.0
+
+    rgb_scale = (
+        (1.0 - color_mix) * gray
+        + color_mix * rgb
+    )
+
+    # l=0, m=0.
+    coeffs[0, :] = rgb_scale * 0.4
+
+    for idx, (l, m) in enumerate(pairs):
+        if l != 1:
+            continue
+
+        if m == -1:
+            coeffs[idx, :] = rgb_scale * (
+                0.2 * math.sin(2.0 * math.pi * u)
+            )
+
+        elif m == 0:
+            coeffs[idx, :] = rgb_scale * (
+                0.2 * math.cos(2.0 * math.pi * u)
+            )
+
+        elif m == 1:
+            coeffs[idx, :] = rgb_scale * (
+                0.2 * math.sin(
+                    2.0 * math.pi * u + 1.0
+                )
+            )
+
+    for idx, (l, m) in enumerate(pairs):
+        if l == 2 and m == 0:
+            coeffs[idx, :] += rgb_scale * (
+                0.05 * math.cos(4.0 * math.pi * u)
+            )
+
+    return coeffs
+
+
+def build_sh_bank():
+    """
+    Returns:
+        [128,27] float32 array.
+    """
+    rows = []
+
+    for env_id in range(NUM_GLOBAL_ENVS):
+        coeffs = sh_for_global_env(
+            env_id,
+            order=SH_ORDER,
+        )  # [9,3]
+
+        rows.append(
+            coeffs.reshape(-1)
+        )
+
+    return np.stack(
+        rows,
+        axis=0,
+    ).astype(np.float32)
+
+
+# ============================================================
+# STATE HELPERS
+# ============================================================
 
 def shortest_periodic_delta(a, b, period):
-    return (b - a + 0.5 * period) % period - 0.5 * period
+    return (
+        (b - a + 0.5 * period) % period
+        - 0.5 * period
+    )
 
 
-def interpolate_periodic(a, b, u, period):
-    delta = shortest_periodic_delta(a, b, period)
-    return (a + u * delta) % period
+def interpolate_periodic(a, b, t, period):
+    return (
+        a
+        + t * shortest_periodic_delta(a, b, period)
+    ) % period
 
 
-def smooth_interpolation(t):
+def smooth_parameter(t):
     """
-    Smooth interpolation from 0 to 1 with zero velocity
-    at the beginning and end.
+    Smooth 0 -> 1 interpolation.
     """
-    return 0.5 - 0.5 * math.cos(math.pi * t)
+    return 0.5 - 0.5 * math.cos(
+        math.pi * t
+    )
 
 
-def smooth_loop(t):
+def smooth_loop_parameter(t):
     """
-    Smooth loop:
-        start -> end -> start
+    Smooth 0 -> 1 -> 0 loop.
     """
-    return 0.5 - 0.5 * math.cos(2.0 * math.pi * t)
+    return 0.5 - 0.5 * math.cos(
+        2.0 * math.pi * t
+    )
 
 
-def get_sh_columns(dataset):
-    """
-    Match the SH column order used by the dataset's parameter builder.
-    """
-    return [
-        c for c in dataset.df.columns
-        if c.startswith("sh_l")
-        and c.endswith(("_r", "_g", "_b"))
-    ]
+def random_volume_state(rng, sh_bank):
+    env_id = int(
+        rng.integers(
+            0,
+            NUM_GLOBAL_ENVS,
+        )
+    )
 
+    return {
+        "ctrl": rng.choice(
+            CTRL_LEVELS,
+            size=4,
+            replace=True,
+        ).astype(np.float32),
 
-def row_to_state(dataset, row, sh_cols):
-    """
-    Extract raw, interpretable parameters from one metadata row.
-    """
-    sample_id = int(row["sample_id"])
-    shape_info = dataset.shape_meta[sample_id]
+        "sigma": float(
+            rng.choice(SIGMA_VALUES)
+        ),
 
-    state = {
-        "ctrl": {
-            c: float(shape_info[c])
-            for c in dataset.ctrl_cols
-        },
+        "base_rgb": rng.uniform(
+            COLOR_LOW,
+            COLOR_HIGH,
+            size=3,
+        ).astype(np.float32),
 
-        "sigma": float(shape_info["sigma"]),
+        "opacity": float(
+            rng.uniform(
+                OPACITY_LOW,
+                OPACITY_HIGH,
+            )
+        ),
 
-        "hue": float(row["hue"]),
-        "saturation": float(row["saturation"]),
+        "phi": float(
+            rng.uniform(0.0, math.pi)
+        ),
 
-        # Volume model does not physically use these.
-        "metallic": 0.0,
-        "roughness": 0.0,
-        "specular": 0.0,
+        "theta": float(
+            rng.uniform(
+                0.0,
+                2.0 * math.pi,
+            )
+        ),
 
-        "opacity": float(row["opacity"]),
+        "radius": FNO_RADIUS,
 
-        "phi": float(row["phi"]),
-        "theta": float(row["theta"]),
-        "radius": float(row["radius"]),
-
-        "sh": {
-            c: float(row[c])
-            for c in sh_cols
-        },
+        "env_id": env_id,
+        "sh": sh_bank[env_id].copy(),
     }
+
+
+def apply_overrides(state, override, sh_bank):
+    state = dict(state)
+
+    if override["ctrl"] is not None:
+        ctrl = np.asarray(
+            override["ctrl"],
+            dtype=np.float32,
+        )
+
+        if ctrl.shape != (4,):
+            raise ValueError(
+                "ctrl override must contain 4 values."
+            )
+
+        state["ctrl"] = np.clip(
+            ctrl,
+            COLOR_LOW,
+            COLOR_HIGH,
+        )
+
+    if override["sigma"] is not None:
+        state["sigma"] = float(
+            np.clip(
+                override["sigma"],
+                SIGMA_VALUES.min(),
+                SIGMA_VALUES.max(),
+            )
+        )
+
+    if override["base_rgb"] is not None:
+        base_rgb = np.asarray(
+            override["base_rgb"],
+            dtype=np.float32,
+        )
+
+        if base_rgb.shape != (3,):
+            raise ValueError(
+                "base_rgb override must contain 3 values."
+            )
+
+        state["base_rgb"] = np.clip(
+            base_rgb,
+            COLOR_LOW,
+            COLOR_HIGH,
+        )
+
+    if override["opacity"] is not None:
+        state["opacity"] = float(
+            np.clip(
+                override["opacity"],
+                OPACITY_LOW,
+                OPACITY_HIGH,
+            )
+        )
+
+    if override["phi"] is not None:
+        state["phi"] = float(
+            np.clip(
+                override["phi"],
+                0.0,
+                math.pi,
+            )
+        )
+
+    if override["theta"] is not None:
+        state["theta"] = float(
+            override["theta"]
+        ) % (2.0 * math.pi)
+
+    if override["env_id"] is not None:
+        env_id = int(
+            np.clip(
+                override["env_id"],
+                0,
+                NUM_GLOBAL_ENVS - 1,
+            )
+        )
+
+        state["env_id"] = env_id
+        state["sh"] = sh_bank[env_id].copy()
 
     return state
 
 
-def interpolate_states(a, b, u, ctrl_cols, sh_cols):
-    """
-    Interpolate two volume parameter states.
-    """
-    out = {
-        "ctrl": {},
-        "sh": {},
+def interpolate_states(start, end, t):
+    return {
+        "ctrl": (
+            (1.0 - t) * start["ctrl"]
+            + t * end["ctrl"]
+        ).astype(np.float32),
+
+        "sigma": float(
+            (1.0 - t) * start["sigma"]
+            + t * end["sigma"]
+        ),
+
+        "base_rgb": (
+            (1.0 - t) * start["base_rgb"]
+            + t * end["base_rgb"]
+        ).astype(np.float32),
+
+        "opacity": float(
+            (1.0 - t) * start["opacity"]
+            + t * end["opacity"]
+        ),
+
+        "phi": float(
+            (1.0 - t) * start["phi"]
+            + t * end["phi"]
+        ),
+
+        "theta": float(
+            interpolate_periodic(
+                start["theta"],
+                end["theta"],
+                t,
+                2.0 * math.pi,
+            )
+        ),
+
+        "radius": FNO_RADIUS,
+
+        # Smooth SH interpolation is useful for visual animation.
+        "sh": (
+            (1.0 - t) * start["sh"]
+            + t * end["sh"]
+        ).astype(np.float32),
     }
 
-    # Shape control points.
-    for c in ctrl_cols:
-        out["ctrl"][c] = (
-            (1.0 - u) * a["ctrl"][c]
-            + u * b["ctrl"][c]
-        )
 
-    # Explicitly interpolate sigma.
-    out["sigma"] = (
-        (1.0 - u) * a["sigma"]
-        + u * b["sigma"]
-    )
+# ============================================================
+# FNO INPUT
+# ============================================================
 
-    # Color.
-    out["hue"] = interpolate_periodic(
-        a["hue"],
-        b["hue"],
-        u,
-        period=1.0,
-    )
-
-    out["saturation"] = (
-        (1.0 - u) * a["saturation"]
-        + u * b["saturation"]
-    )
-
-    # Volume opacity/density control.
-    out["opacity"] = (
-        (1.0 - u) * a["opacity"]
-        + u * b["opacity"]
-    )
-
-    # Camera angles.
-    out["phi"] = (
-        (1.0 - u) * a["phi"]
-        + u * b["phi"]
-    )
-
-    out["theta"] = interpolate_periodic(
-        a["theta"],
-        b["theta"],
-        u,
-        period=2.0 * math.pi,
-    )
-
-    out["radius"] = (
-        (1.0 - u) * a["radius"]
-        + u * b["radius"]
-    )
-
-    # Environment SH.
-    for c in sh_cols:
-        out["sh"][c] = (
-            (1.0 - u) * a["sh"][c]
-            + u * b["sh"][c]
-        )
-
-    # Keep volume-only material values zero.
-    out["metallic"] = 0.0
-    out["roughness"] = 0.0
-    out["specular"] = 0.0
-
-    return out
-
-
-def state_to_normalized_vector(
+def build_normalized_volume_vector(
     state,
-    dataset,
     param_mean,
     param_std,
-    sh_cols,
 ):
     """
-    Construct the parameter vector in exactly the same order
-    as PlaneDatasetParamsToPremultRGBA.
+    RGB-conditioned volume-model input.
 
-    This is for a volume model, so:
+    Exact order:
+
+        ctrl[0:4]
+        sigma
+        base_r, base_g, base_b
         metallic = 0
         roughness = 0
+        opacity
         specular = 0
+        sin(phi), cos(phi)
+        sin(theta), cos(theta)
+        radius
+        27 SH values
         is_volume = 1
     """
-    scalars = []
+    ctrl = np.clip(
+        state["ctrl"],
+        COLOR_LOW,
+        COLOR_HIGH,
+    )
 
-    # Shape parameters.
-    for c in dataset.ctrl_cols:
-        scalars.append(state["ctrl"][c])
+    rgb = np.clip(
+        state["base_rgb"],
+        COLOR_LOW,
+        COLOR_HIGH,
+    )
 
-    scalars.append(state["sigma"])
+    raw = np.concatenate(
+        [
+            ctrl,
+            np.array(
+                [
+                    state["sigma"],
+                    rgb[0],
+                    rgb[1],
+                    rgb[2],
 
-    # Material parameters.
-    scalars.extend([
-        state["hue"],
-        state["saturation"],
-        0.0,                    # metallic
-        0.0,                    # roughness
-        state["opacity"],
-        0.0,                    # specular
-    ])
+                    # Volume convention.
+                    0.0,  # metallic
+                    0.0,  # roughness
 
-    # Camera parameters.
-    phi = state["phi"]
-    theta = state["theta"]
+                    state["opacity"],
+                    0.0,  # specular
 
-    scalars.extend([
-        math.sin(phi),
-        math.cos(phi),
-        math.sin(theta),
-        math.cos(theta),
-        state["radius"],
-    ])
+                    math.sin(state["phi"]),
+                    math.cos(state["phi"]),
+                    math.sin(state["theta"]),
+                    math.cos(state["theta"]),
+                    state["radius"],
+                ],
+                dtype=np.float32,
+            ),
+            state["sh"].astype(np.float32),
+            np.array([1.0], dtype=np.float32),
+        ],
+        axis=0,
+    ).astype(np.float32)
 
-    # Environment SH parameters.
-    for c in sh_cols:
-        scalars.append(state["sh"][c])
-
-    # Volume indicator.
-    scalars.append(1.0)
-
-    raw = np.asarray(scalars, dtype=np.float32)
-
-    if raw.shape[0] != len(param_mean):
+    if raw.shape[0] != 45:
         raise RuntimeError(
-            f"Parameter dimension mismatch: "
-            f"constructed {raw.shape[0]}, "
-            f"expected {len(param_mean)}"
+            f"Expected 45 volume parameters, got {raw.shape[0]}"
         )
 
-    normalized = (raw - param_mean) / param_std
-    return normalized.astype(np.float32)
+    if raw.shape[0] != param_mean.shape[0]:
+        raise RuntimeError(
+            f"Parameter dimension mismatch: "
+            f"constructed={raw.shape[0]}, "
+            f"checkpoint expects={param_mean.shape[0]}"
+        )
+
+    return (
+        (raw - param_mean) / param_std
+    ).astype(np.float32)
 
 
-def make_rgb_frame(model_output, background):
+# ============================================================
+# VIDEO FRAME HELPERS
+# ============================================================
+
+def make_rgb_frame(model_output):
     """
-    model_output: [4,H,W]
-        channels 0:3 = premultiplied RGB
-        channel 3   = alpha
+    model_output:
+        [4,H,W] = premultiplied RGB + alpha.
     """
-    output = np.clip(model_output, 0.0, 1.0)
+    output = np.clip(
+        model_output,
+        0.0,
+        1.0,
+    )
 
     color = output[:3]
     alpha = output[3:4]
 
-    bg = background.reshape(3, 1, 1)
+    background = VIDEO_BACKGROUND.reshape(
+        3,
+        1,
+        1,
+    )
 
-    # Composite premultiplied color over background.
-    rgb = color + (1.0 - alpha) * bg
-    rgb = np.transpose(rgb, (1, 2, 0))
-    rgb = np.clip(rgb, 0.0, 1.0)
+    visible = color + (
+        1.0 - alpha
+    ) * background
 
-    return (rgb * 255.0 + 0.5).astype(np.uint8)
+    frame = np.transpose(
+        visible,
+        (1, 2, 0),
+    )
+
+    return (
+        np.clip(frame, 0.0, 1.0)
+        * 255.0
+        + 0.5
+    ).astype(np.uint8)
 
 
 def make_alpha_frame(model_output):
-    """
-    Convert alpha to grayscale RGB for video writing.
-    """
-    alpha = np.clip(model_output[3], 0.0, 1.0)
-    frame = np.repeat(alpha[..., None], 3, axis=2)
+    alpha = np.clip(
+        model_output[3],
+        0.0,
+        1.0,
+    )
 
-    return (frame * 255.0 + 0.5).astype(np.uint8)
+    alpha_rgb = np.repeat(
+        alpha[..., None],
+        3,
+        axis=2,
+    )
+
+    return (
+        alpha_rgb * 255.0 + 0.5
+    ).astype(np.uint8)
 
 
 # ============================================================
@@ -330,65 +589,48 @@ def make_alpha_frame(model_output):
 
 def main():
     device = torch.device(
-        "cuda" if torch.cuda.is_available() else "cpu"
+        "cuda"
+        if torch.cuda.is_available()
+        else "cpu"
     )
+
     print("Using device:", device)
 
-    # --------------------------------------------------------
-    # Load dataset metadata and normalization information.
-    # --------------------------------------------------------
-    dataset = PlaneDatasetParamsToPremultRGBA(
-        base_dir=BASE_DIR,
-        img_meta_csv=IMG_META_CSV,
-        vol_meta_csv=VOL_META_CSV,
-        renders_dir=RENDERS_DIR,
-        alpha_dir=ALPHA_DIR,
-        alpha_meta_csv=ALPHA_META_CSV,
-        img_size=IMG_SIZE,
-        use_sh=True,
-        normalize_params=True,
+    rng = np.random.default_rng(
+        RANDOM_SEED
     )
 
-    if "render_mode" not in dataset.df.columns:
-        raise RuntimeError(
-            "Dataset is missing render_mode."
-        )
+    sh_bank = build_sh_bank()
 
-    # Keep only volume rows.
-    volume_mask = (
-        dataset.df["render_mode"].astype(str) == "volume"
+    start_state = apply_overrides(
+        random_volume_state(rng, sh_bank),
+        START_OVERRIDE,
+        sh_bank,
     )
-    volume_df = dataset.df[volume_mask].reset_index(drop=True)
 
-    if len(volume_df) == 0:
-        raise RuntimeError("No volume rows found.")
+    end_state = apply_overrides(
+        random_volume_state(rng, sh_bank),
+        END_OVERRIDE,
+        sh_bank,
+    )
 
-    if START_VOLUME_INDEX >= len(volume_df):
-        raise IndexError("START_VOLUME_INDEX is out of range.")
-
-    if END_VOLUME_INDEX >= len(volume_df):
-        raise IndexError("END_VOLUME_INDEX is out of range.")
-
-    start_row = volume_df.iloc[START_VOLUME_INDEX]
-    end_row = volume_df.iloc[END_VOLUME_INDEX]
-
+    print("Start volume state:")
     print(
-        "Start volume index:",
-        START_VOLUME_INDEX,
-        "sample_id:",
-        int(start_row["sample_id"]),
-    )
-    print(
-        "End volume index:",
-        END_VOLUME_INDEX,
-        "sample_id:",
-        int(end_row["sample_id"]),
+        "  ctrl:", start_state["ctrl"],
+        "sigma:", start_state["sigma"],
+        "rgb:", start_state["base_rgb"],
+        "opacity:", start_state["opacity"],
+        "env:", start_state["env_id"],
     )
 
-    # --------------------------------------------------------
-    # Load checkpoint.
-    # --------------------------------------------------------
-    print("Loading checkpoint:", CHECKPOINT_PATH)
+    print("End volume state:")
+    print(
+        "  ctrl:", end_state["ctrl"],
+        "sigma:", end_state["sigma"],
+        "rgb:", end_state["base_rgb"],
+        "opacity:", end_state["opacity"],
+        "env:", end_state["env_id"],
+    )
 
     checkpoint = torch.load(
         CHECKPOINT_PATH,
@@ -396,102 +638,42 @@ def main():
         weights_only=False,
     )
 
-    checkpoint_state = checkpoint.get(
-        "model_state",
-        checkpoint,
-    )
-    checkpoint_state.pop("_metadata", None)
-
-    checkpoint_mode = checkpoint.get("mode", "unknown")
-    if checkpoint_mode != "unknown" and checkpoint_mode != "volume":
-        print(
-            f"[WARN] Checkpoint mode is {checkpoint_mode!r}, "
-            "not 'volume'."
-        )
-
-    checkpoint_latent_dim = int(
-        checkpoint.get(
-            "latent_dim",
-            dataset.latent_dim,
-        )
+    state_dict = dict(
+        checkpoint["model_state"]
     )
 
-    if checkpoint_latent_dim != dataset.latent_dim:
+    state_dict.pop("_metadata", None)
+
+    latent_dim = int(
+        checkpoint["latent_dim"]
+    )
+
+    if latent_dim != 45:
         raise RuntimeError(
-            f"Checkpoint latent_dim={checkpoint_latent_dim}, "
-            f"but dataset latent_dim={dataset.latent_dim}"
+            f"Expected RGB-conditioned latent_dim=45, "
+            f"got {latent_dim}"
         )
 
-    if "param_mean" in checkpoint:
-        param_mean = to_numpy(
-            checkpoint["param_mean"]
-        ).astype(np.float32)
-    else:
-        param_mean = dataset.param_mean.astype(np.float32)
+    param_mean = np.asarray(
+        checkpoint["param_mean"],
+        dtype=np.float32,
+    )
 
-    if "param_std" in checkpoint:
-        param_std = to_numpy(
-            checkpoint["param_std"]
-        ).astype(np.float32)
-    else:
-        param_std = dataset.param_std.astype(np.float32)
+    param_std = np.asarray(
+        checkpoint["param_std"],
+        dtype=np.float32,
+    )
 
     model = FNOPlusResNetSingle(
-        latent_dim=checkpoint_latent_dim,
+        latent_dim=latent_dim,
         img_size=IMG_SIZE,
     ).to(device)
 
-    model.load_state_dict(checkpoint_state)
+    model.load_state_dict(state_dict)
     model.eval()
 
-    print("Checkpoint loaded.")
+    print("Loaded checkpoint:", CHECKPOINT_PATH)
 
-    # --------------------------------------------------------
-    # Build endpoint states.
-    # --------------------------------------------------------
-    sh_cols = get_sh_columns(dataset)
-
-    start_state = row_to_state(
-        dataset,
-        start_row,
-        sh_cols,
-    )
-
-    end_state = row_to_state(
-        dataset,
-        end_row,
-        sh_cols,
-    )
-
-    # Override endpoint sigmas if requested.
-    if START_SIGMA is not None:
-        start_state["sigma"] = float(START_SIGMA)
-
-    if END_SIGMA is not None:
-        end_state["sigma"] = float(END_SIGMA)
-
-    # Override endpoint opacity if requested.
-    if START_OPACITY is not None:
-        start_state["opacity"] = float(START_OPACITY)
-
-    if END_OPACITY is not None:
-        end_state["opacity"] = float(END_OPACITY)
-
-    print(
-        f"Sigma interpolation: "
-        f"{start_state['sigma']:.6f} -> "
-        f"{end_state['sigma']:.6f}"
-    )
-
-    print(
-        f"Opacity interpolation: "
-        f"{start_state['opacity']:.6f} -> "
-        f"{end_state['opacity']:.6f}"
-    )
-
-    # --------------------------------------------------------
-    # Create video writers.
-    # --------------------------------------------------------
     rgb_writer = imageio.get_writer(
         str(OUTPUT_RGB_VIDEO),
         fps=FPS,
@@ -506,8 +688,8 @@ def main():
         quality=8,
     )
 
-    side_writer = imageio.get_writer(
-        str(OUTPUT_SIDE_BY_SIDE_VIDEO),
+    combined_writer = imageio.get_writer(
+        str(OUTPUT_COMBINED_VIDEO),
         fps=FPS,
         codec="libx264",
         quality=8,
@@ -515,36 +697,38 @@ def main():
 
     try:
         with torch.no_grad():
-            for frame_idx in range(NUM_FRAMES):
-                t = frame_idx / max(NUM_FRAMES - 1, 1)
+            for frame_index in range(NUM_FRAMES):
+                t = frame_index / max(
+                    NUM_FRAMES - 1,
+                    1,
+                )
 
-                # Use this for start -> end.
-                u = smooth_interpolation(t)
-
-                # For a looping animation, replace the previous line with:
-                # u = smooth_loop(t)
+                if LOOP_BACK:
+                    interpolation_t = smooth_loop_parameter(t)
+                else:
+                    interpolation_t = smooth_parameter(t)
 
                 state = interpolate_states(
                     start_state,
                     end_state,
-                    u,
-                    dataset.ctrl_cols,
-                    sh_cols,
+                    interpolation_t,
                 )
 
-                param_np = state_to_normalized_vector(
+                param_np = build_normalized_volume_vector(
                     state=state,
-                    dataset=dataset,
                     param_mean=param_mean,
                     param_std=param_std,
-                    sh_cols=sh_cols,
                 )
 
                 param_tensor = torch.from_numpy(
                     param_np
-                ).float().unsqueeze(0).to(device)
+                ).unsqueeze(0).to(
+                    device=device,
+                    dtype=torch.float32,
+                )
 
                 prediction = model(param_tensor)
+
                 prediction_np = (
                     prediction[0]
                     .detach()
@@ -553,46 +737,37 @@ def main():
                 )
 
                 rgb_frame = make_rgb_frame(
-                    prediction_np,
-                    VIDEO_BACKGROUND,
+                    prediction_np
                 )
 
                 alpha_frame = make_alpha_frame(
-                    prediction_np,
+                    prediction_np
                 )
 
-                if SIDE_BY_SIDE_AXIS == 0:
-                    combined_frame = np.concatenate(
-                        [rgb_frame, alpha_frame],
-                        axis=0,
-                    )
-                else:
-                    combined_frame = np.concatenate(
-                        [rgb_frame, alpha_frame],
-                        axis=1,
-                    )
+                # RGB on top; alpha below.
+                combined_frame = np.concatenate(
+                    [rgb_frame, alpha_frame],
+                    axis=0,
+                )
 
                 rgb_writer.append_data(rgb_frame)
                 alpha_writer.append_data(alpha_frame)
-                side_writer.append_data(combined_frame)
+                combined_writer.append_data(combined_frame)
 
-                if frame_idx % 10 == 0:
+                if frame_index % 10 == 0:
                     print(
                         f"Rendered frame "
-                        f"{frame_idx + 1}/{NUM_FRAMES}"
+                        f"{frame_index + 1}/{NUM_FRAMES}"
                     )
 
     finally:
         rgb_writer.close()
         alpha_writer.close()
-        side_writer.close()
+        combined_writer.close()
 
     print("Saved RGB video:", OUTPUT_RGB_VIDEO)
     print("Saved alpha video:", OUTPUT_ALPHA_VIDEO)
-    print(
-        "Saved RGB/alpha video:",
-        OUTPUT_SIDE_BY_SIDE_VIDEO,
-    )
+    print("Saved combined video:", OUTPUT_COMBINED_VIDEO)
 
 
 if __name__ == "__main__":

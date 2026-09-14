@@ -3,216 +3,582 @@ import bpy
 import os
 import csv
 import math
-import numpy as np
-import colorsys
 import sys
 from pathlib import Path
-import imageio.v2 as imageio
+
+import numpy as np
 import pandas as pd
+import imageio.v2 as imageio
 
-# ==============================
+
+# ============================================================
 # CONFIGURATION
-# ==============================
+# ============================================================
+
 PROJECT_ROOT = Path(__file__).resolve().parent
-BASE_DIR = PROJECT_ROOT / "plane_dataset_4"
 
-VOLUME_METADATA_CSV = os.path.join(BASE_DIR, "metadata_volumes.csv")
+BASE_DIR = PROJECT_ROOT / "implicit_bspline_dataset" / "volumes"
+VDB_DIR = BASE_DIR / "vdb"
 
-RENDER_DIR = os.path.join(BASE_DIR, "renders")
-os.makedirs(RENDER_DIR, exist_ok=True)
+VOLUME_METADATA_CSV = BASE_DIR / "metadata_volumes.csv"
 
-ALPHA_DIR = os.path.join(BASE_DIR, "hard_alpha")
-os.makedirs(ALPHA_DIR, exist_ok=True)
+RENDER_DIR = PROJECT_ROOT / "implicit_bspline_dataset" / "renders_balanced"
+ALPHA_DIR = PROJECT_ROOT / "implicit_bspline_dataset" / "hard_alpha_balanced"
 
-# ENV
+RENDER_DIR.mkdir(parents=True, exist_ok=True)
+ALPHA_DIR.mkdir(parents=True, exist_ok=True)
+
+# ------------------------------------------------------------
+# Balanced geometry selection
+# ------------------------------------------------------------
+
+# Number of distinct 2x2x2 control grids / geometries selected.
+#
+# If each geometry has 5 sigma values:
+#     10,000 geometries x 5 sigmas = 50,000 volume samples.
+TARGET_NUM_GEOMETRIES = 10000
+
+# Makes the geometry subset reproducible.
+GEOMETRY_SELECTION_SEED = 2025
+
+# ------------------------------------------------------------
+# Views and render modes
+# ------------------------------------------------------------
+
+NUM_VIEWS_PER_VOLUME = 16
+
+RENDER_SURFACE = True
+RENDER_VOLUME = True
+
+# 16 views x 2 modes = 32 images/volume.
+CAMERA_RADIUS = 2.2
+
+# ------------------------------------------------------------
+# Render settings
+# ------------------------------------------------------------
+
+RES_X = 32
+RES_Y = 32
+
+# Start lower for a test run. Increase only if noise is a problem.
+SAMPLES = 512
+
+# Opacity applies to both modes:
+#
+# Surface:
+#   shader mixture between Transparent and Principled BSDF.
+#
+# Volume:
+#   converted to a sigma-normalized density multiplier.
+MIN_OPACITY = 0.01
+MAX_OPACITY = 0.99
+
+# Must agree with export_to_vdb_shards.py.
+BAND_SIGMAS = 3.0
+
+# ------------------------------------------------------------
+# Environments
+# ------------------------------------------------------------
+
 NUM_GLOBAL_ENVS = 128
 
-# render settings
-RES_X = 64
-RES_Y = 64
-SAMPLES = 1024
+ENV_DIR = BASE_DIR / "envmaps"
+ENV_DIR.mkdir(parents=True, exist_ok=True)
 
-# ENV MAP + SH
-ENV_DIR = os.path.join(BASE_DIR, "envmaps")
-os.makedirs(ENV_DIR, exist_ok=True)
-
-ENV_H = 16
+ENV_H = 32
 ENV_W = 32
 SH_ORDER = 2
 
-IMAGES_PER_SHAPE = 300
-SHARD_SIZE = 5000
-ALPHA_SHARD_SIZE = SHARD_SIZE
+# ------------------------------------------------------------
+# Shard output
+# ------------------------------------------------------------
 
-# ==============================
-# UTILITIES
-# ==============================
+SHARD_SIZE = 5000
+
+
+# ============================================================
+# PATH / SCENE UTILITIES
+# ============================================================
+
+def resolve_csv_path(path_from_csv, base_dir: Path) -> Path:
+    """
+    Resolve absolute paths and relative metadata paths.
+
+    Your current project can use absolute paths directly.
+    """
+    path = Path(str(path_from_csv))
+
+    if path.is_absolute():
+        return path
+
+    candidate = base_dir / path
+    if candidate.is_file():
+        return candidate
+
+    candidate = base_dir.parent / path
+    if candidate.is_file():
+        return candidate
+
+    return base_dir / path
+
 
 def clean_scene():
-    bpy.ops.object.select_all(action='SELECT')
+    """Remove all objects and unused Blender datablocks."""
+    bpy.ops.object.select_all(action="SELECT")
     bpy.ops.object.delete()
+
     for mesh in list(bpy.data.meshes):
         if not mesh.users:
             bpy.data.meshes.remove(mesh)
-    for vol in list(bpy.data.volumes):
-        if not vol.users:
-            bpy.data.volumes.remove(vol)
-    for mat in list(bpy.data.materials):
-        if not mat.users:
-            bpy.data.materials.remove(mat)
-    for light in list(bpy.data.lights):
-        if not light.users:
-            bpy.data.lights.remove(light)
 
-def setup_world_and_lighting(scene):
+    for volume in list(bpy.data.volumes):
+        if not volume.users:
+            bpy.data.volumes.remove(volume)
+
+    for camera in list(bpy.data.cameras):
+        if not camera.users:
+            bpy.data.cameras.remove(camera)
+
+    for material in list(bpy.data.materials):
+        if not material.users:
+            bpy.data.materials.remove(material)
+
+
+def clear_shape_objects():
+    """
+    Remove objects belonging to the previous geometry/sample.
+
+    Reusable materials and world data remain.
+    """
+    for obj in list(bpy.data.objects):
+        bpy.data.objects.remove(obj, do_unlink=True)
+
+    for mesh in list(bpy.data.meshes):
+        if not mesh.users:
+            bpy.data.meshes.remove(mesh)
+
+    for volume in list(bpy.data.volumes):
+        if not volume.users:
+            bpy.data.volumes.remove(volume)
+
+    for camera in list(bpy.data.cameras):
+        if not camera.users:
+            bpy.data.cameras.remove(camera)
+
+
+# ============================================================
+# WORLD / CAMERA
+# ============================================================
+
+def set_black_world(scene):
+    """Black non-illuminating world used for silhouette-mask rendering."""
     world = bpy.data.worlds.new("World") if scene.world is None else scene.world
     scene.world = world
     world.use_nodes = True
-    w_nodes = world.node_tree.nodes
-    w_links = world.node_tree.links
-    for n in list(w_nodes):
-        w_nodes.remove(n)
-    world_output = w_nodes.new("ShaderNodeOutputWorld")
-    bg = w_nodes.new("ShaderNodeBackground")
-    bg.inputs["Color"].default_value = (0.0, 0.0, 0.0, 1)
-    bg.inputs["Strength"].default_value = 0.0
-    w_links.new(bg.outputs["Background"], world_output.inputs["Surface"])
-    for o in list(bpy.data.objects):
-        if o.type == 'LIGHT':
-            bpy.data.objects.remove(o, do_unlink=True)
+
+    nodes = world.node_tree.nodes
+    links = world.node_tree.links
+
+    for node in list(nodes):
+        nodes.remove(node)
+
+    output_node = nodes.new("ShaderNodeOutputWorld")
+    background_node = nodes.new("ShaderNodeBackground")
+
+    background_node.inputs["Color"].default_value = (0.0, 0.0, 0.0, 1.0)
+    background_node.inputs["Strength"].default_value = 0.0
+
+    links.new(
+        background_node.outputs["Background"],
+        output_node.inputs["Surface"],
+    )
+
 
 def create_camera(scene, target_obj):
-    cam_data = bpy.data.cameras.new(name="Camera")
-    cam = bpy.data.objects.new("Camera", cam_data)
-    scene.collection.objects.link(cam)
-    scene.camera = cam
-    con = cam.constraints.new(type='TRACK_TO')
-    con.target = target_obj
-    con.track_axis = 'TRACK_NEGATIVE_Z'
-    con.up_axis = 'UP_Y'
-    return cam
+    """Create a camera tracking target_obj."""
+    camera_data = bpy.data.cameras.new(name="Camera")
+    camera_obj = bpy.data.objects.new("Camera", camera_data)
 
-def set_camera_from_spherical(cam, radius, phi, theta):
-    x = radius * math.sin(phi) * math.cos(theta)
-    y = radius * math.sin(phi) * math.sin(theta)
-    z = radius * math.cos(phi)
-    cam.location.x = x
-    cam.location.y = y
-    cam.location.z = z
+    scene.collection.objects.link(camera_obj)
+    scene.camera = camera_obj
 
-def make_material_from_params(rgb, metallic, roughness, specular, opacity):
-    # surface: Transparent + Principled, mixed by opacity
-    r, g, b = rgb
-    base_color = (r, g, b, 1.0)
+    track = camera_obj.constraints.new(type="TRACK_TO")
+    track.target = target_obj
+    track.track_axis = "TRACK_NEGATIVE_Z"
+    track.up_axis = "UP_Y"
 
-    mat = bpy.data.materials.new(name="SurfMat")
-    mat.use_nodes = True
-    nodes = mat.node_tree.nodes
-    links = mat.node_tree.links
-    for n in list(nodes):
-        nodes.remove(n)
+    return camera_obj
 
-    out = nodes.new("ShaderNodeOutputMaterial")
-    out.location = (400, 0)
 
-    bsdf = nodes.new("ShaderNodeBsdfPrincipled")
-    bsdf.location = (0, 100)
-    bsdf.inputs["Base Color"].default_value = base_color
-    bsdf.inputs["Metallic"].default_value   = metallic
-    bsdf.inputs["Roughness"].default_value  = roughness
-    if "Specular" in bsdf.inputs:
-        bsdf.inputs["Specular"].default_value = specular
+def set_camera_from_direction(camera, direction, radius):
+    """Place camera at radius * normalized(direction)."""
+    direction = np.asarray(direction, dtype=np.float64)
+    direction /= np.linalg.norm(direction)
 
-    transp = nodes.new("ShaderNodeBsdfTransparent")
-    transp.location = (0, -50)
+    camera.location = (
+        float(radius * direction[0]),
+        float(radius * direction[1]),
+        float(radius * direction[2]),
+    )
 
-    mix = nodes.new("ShaderNodeMixShader")
-    mix.location = (200, 50)
-    mix.inputs["Fac"].default_value = opacity  # 0=transparent, 1=opaque
 
-    # (1-opacity)*Transparent + opacity*BSDF
-    links.new(transp.outputs["BSDF"], mix.inputs[1])
-    links.new(bsdf.outputs["BSDF"],   mix.inputs[2])
-    links.new(mix.outputs["Shader"],  out.inputs["Surface"])
+def direction_to_phi_theta(direction):
+    """
+    Convert direction to this convention:
+
+        x = r sin(phi) cos(theta)
+        y = r sin(phi) sin(theta)
+        z = r cos(phi)
+    """
+    x, y, z = np.asarray(direction, dtype=np.float64)
+
+    phi = math.acos(float(np.clip(z, -1.0, 1.0)))
+    theta = math.atan2(float(y), float(x))
+
+    if theta < 0.0:
+        theta += 2.0 * math.pi
+
+    return float(phi), float(theta)
+
+
+# ============================================================
+# MATERIALS
+# ============================================================
+
+def make_surface_material():
+    """Create one reusable transparent/Principled surface material."""
+    material = bpy.data.materials.new(name="ReusableSurfaceMaterial")
+    material.use_nodes = True
+
+    nodes = material.node_tree.nodes
+    links = material.node_tree.links
+
+    for node in list(nodes):
+        nodes.remove(node)
+
+    output_node = nodes.new("ShaderNodeOutputMaterial")
+    output_node.location = (450, 0)
+
+    principled = nodes.new("ShaderNodeBsdfPrincipled")
+    principled.name = "SurfacePrincipled"
+    principled.location = (0, 100)
+
+    transparent = nodes.new("ShaderNodeBsdfTransparent")
+    transparent.location = (0, -50)
+
+    opacity_mix = nodes.new("ShaderNodeMixShader")
+    opacity_mix.name = "SurfaceOpacityMix"
+    opacity_mix.location = (220, 40)
+
+    links.new(transparent.outputs["BSDF"], opacity_mix.inputs[1])
+    links.new(principled.outputs["BSDF"], opacity_mix.inputs[2])
+    links.new(opacity_mix.outputs["Shader"], output_node.inputs["Surface"])
+
+    return material
+
+
+def update_surface_material(
+    material,
+    rgb,
+    metallic,
+    roughness,
+    specular,
+    opacity,
+):
+    """Update the reusable surface material for one frame."""
+    nodes = material.node_tree.nodes
+
+    principled = nodes["SurfacePrincipled"]
+    opacity_mix = nodes["SurfaceOpacityMix"]
+
+    r, g, b = [float(x) for x in rgb]
+
+    principled.inputs["Base Color"].default_value = (r, g, b, 1.0)
+    principled.inputs["Metallic"].default_value = float(metallic)
+    principled.inputs["Roughness"].default_value = float(roughness)
+
+    # Blender version compatibility.
+    if "Specular" in principled.inputs:
+        principled.inputs["Specular"].default_value = float(specular)
+    elif "Specular IOR Level" in principled.inputs:
+        principled.inputs["Specular IOR Level"].default_value = float(specular)
+
+    opacity_mix.inputs["Fac"].default_value = float(opacity)
 
     material_type = "plastic" if metallic <= 1e-3 else "metal"
-    return mat, (r, g, b, opacity), material_type
 
-def make_volume_material_from_params(rgb, density_scale):
-    r, g, b = rgb
-    color = (r, g, b, 1.0)
+    return (r, g, b, float(opacity)), material_type
 
-    mat = bpy.data.materials.new(name="VolMat")
-    mat.use_nodes = True
-    nodes = mat.node_tree.nodes
-    links = mat.node_tree.links
-    for n in list(nodes):
-        nodes.remove(n)
 
-    out = nodes.new("ShaderNodeOutputMaterial")
-    out.location = (400, 0)
+def make_volume_material():
+    """Create one reusable VDB density material."""
+    material = bpy.data.materials.new(name="ReusableVolumeMaterial")
+    material.use_nodes = True
 
-    vol = nodes.new("ShaderNodeVolumePrincipled")
-    vol.location = (0, 0)
-    vol.inputs["Color"].default_value   = color
-    vol.inputs["Density"].default_value = 1.0
+    nodes = material.node_tree.nodes
+    links = material.node_tree.links
 
-    vol_info = nodes.new("ShaderNodeVolumeInfo")
-    vol_info.location = (-300, 0)
+    for node in list(nodes):
+        nodes.remove(node)
 
-    mul = nodes.new("ShaderNodeMath")
-    mul.operation = 'MULTIPLY'
-    mul.inputs[1].default_value = density_scale
-    mul.location = (-100, -50)
+    output_node = nodes.new("ShaderNodeOutputMaterial")
+    output_node.location = (450, 0)
 
-    links.new(vol_info.outputs["Density"], mul.inputs[0])
-    links.new(mul.outputs["Value"], vol.inputs["Density"])
-    links.new(vol.outputs["Volume"], out.inputs["Volume"])
+    principled_volume = nodes.new("ShaderNodeVolumePrincipled")
+    principled_volume.name = "VolumePrincipled"
+    principled_volume.location = (120, 0)
 
-    return mat, (r, g, b, 1.0)
+    volume_info = nodes.new("ShaderNodeVolumeInfo")
+    volume_info.location = (-300, 0)
+
+    multiplier = nodes.new("ShaderNodeMath")
+    multiplier.name = "VolumeDensityMultiplier"
+    multiplier.operation = "MULTIPLY"
+    multiplier.location = (-80, -50)
+    multiplier.inputs[1].default_value = 1.0
+
+    links.new(
+        volume_info.outputs["Density"],
+        multiplier.inputs[0],
+    )
+    links.new(
+        multiplier.outputs["Value"],
+        principled_volume.inputs["Density"],
+    )
+    links.new(
+        principled_volume.outputs["Volume"],
+        output_node.inputs["Volume"],
+    )
+
+    return material
+
+
+def update_volume_material(material, rgb, density_scale):
+    """Update reusable volume material values."""
+    nodes = material.node_tree.nodes
+
+    principled_volume = nodes["VolumePrincipled"]
+    multiplier = nodes["VolumeDensityMultiplier"]
+
+    r, g, b = [float(x) for x in rgb]
+
+    principled_volume.inputs["Color"].default_value = (r, g, b, 1.0)
+    multiplier.inputs[1].default_value = float(density_scale)
+
+    return (r, g, b, 1.0)
+
 
 def make_mask_material():
+    """Opaque white emission material for surface silhouette alpha masks."""
+    material = bpy.data.materials.new(name="ReusableMaskMaterial")
+    material.use_nodes = True
+
+    nodes = material.node_tree.nodes
+    links = material.node_tree.links
+
+    for node in list(nodes):
+        nodes.remove(node)
+
+    output_node = nodes.new("ShaderNodeOutputMaterial")
+    output_node.location = (220, 0)
+
+    emission = nodes.new("ShaderNodeEmission")
+    emission.location = (0, 0)
+    emission.inputs["Color"].default_value = (1.0, 1.0, 1.0, 1.0)
+    emission.inputs["Strength"].default_value = 1.0
+
+    links.new(emission.outputs["Emission"], output_node.inputs["Surface"])
+
+    return material
+
+
+# ============================================================
+# VOLUME OPACITY
+# ============================================================
+
+def density_scale_for_sigma(sigma, target_opacity):
     """
-    Opaque white emission; we only care about alpha coverage.
+    Convert desired front-facing opacity to a density multiplier.
+
+    Stored VDB density is approximately:
+
+        V(d) = exp(-0.5 * (d / sigma)^2)
+
+    The VDB retains approximately ±3 sigma. This scaling compensates for
+    sigma, so thin and thick Gaussian shells have approximately equal
+    normal-incidence opacity for a common target_opacity.
+
+    Grazing-angle views naturally look more opaque.
     """
-    mat = bpy.data.materials.new(name="MaskMat")
-    mat.use_nodes = True
-    nodes = mat.node_tree.nodes
-    links = mat.node_tree.links
-    for n in list(nodes):
-        nodes.remove(n)
+    sigma = float(sigma)
+    target_opacity = float(target_opacity)
 
-    out = nodes.new("ShaderNodeOutputMaterial")
-    out.location = (200, 0)
+    if sigma <= 0.0:
+        raise ValueError(f"sigma must be positive, got {sigma}")
 
-    emit = nodes.new("ShaderNodeEmission")
-    emit.location = (0, 0)
-    emit.inputs["Color"].default_value = (1.0, 1.0, 1.0, 1.0)
-    emit.inputs["Strength"].default_value = 1.0
+    if target_opacity <= 0.0:
+        return 0.0
 
-    links.new(emit.outputs["Emission"], out.inputs["Surface"])
-    return mat
+    target_opacity = min(target_opacity, 1.0 - 1e-6)
 
-def load_vdb_volume(sample_id, volume_rel_path):
-    vol_npy = Path(volume_rel_path)
-    if vol_npy.suffix != ".npy":
-        raise ValueError(f"Expected .npy in volume_path, got: {volume_rel_path}")
-    vol_vdb = vol_npy.with_suffix(".vdb")
-    full_vdb = (BASE_DIR / vol_vdb).resolve()
-    if not full_vdb.is_file():
-        raise FileNotFoundError(f"VDB file not found: {full_vdb}")
-    bpy.ops.object.volume_import(filepath=str(full_vdb))
-    vol_obj = bpy.context.object
-    vol_obj.name = f"vol_{sample_id:04d}"
-    return vol_obj
+    optical_depth = -math.log(1.0 - target_opacity)
 
-# --- SH helpers ---
+    retained_integral = (
+        math.sqrt(2.0 * math.pi)
+        * sigma
+        * math.erf(BAND_SIGMAS / math.sqrt(2.0))
+    )
+
+    return optical_depth / retained_integral
+
+
+# ============================================================
+# MESH / VDB LOADING
+# ============================================================
+
+def load_mesh_object(sample_id, mesh_path_from_csv):
+    """
+    Load the F=0 marching-cubes mesh and center it by bounding-box center.
+
+    The corresponding VDB receives the same shift to remain aligned.
+    """
+    mesh_path = resolve_csv_path(mesh_path_from_csv, BASE_DIR)
+
+    if not mesh_path.is_file():
+        raise FileNotFoundError(f"Mesh not found: {mesh_path}")
+
+    mesh_data_np = np.load(mesh_path)
+
+    verts = mesh_data_np["verts"].astype(np.float32)
+    faces = mesh_data_np["faces"].astype(np.int32)
+
+    if verts.ndim != 2 or verts.shape[1] != 3:
+        raise ValueError(f"Unexpected verts shape: {verts.shape}")
+
+    if faces.ndim != 2 or faces.shape[1] != 3:
+        raise ValueError(f"Unexpected faces shape: {faces.shape}")
+
+    vmin = verts.min(axis=0)
+    vmax = verts.max(axis=0)
+    center = 0.5 * (vmin + vmax)
+
+    centered_verts = verts - center
+
+    blender_mesh = bpy.data.meshes.new(f"mesh_{sample_id:06d}")
+    blender_mesh.from_pydata(
+        centered_verts.tolist(),
+        [],
+        faces.tolist(),
+    )
+    blender_mesh.update()
+
+    mesh_obj = bpy.data.objects.new(
+        f"shape_mesh_{sample_id:06d}",
+        blender_mesh,
+    )
+    bpy.context.scene.collection.objects.link(mesh_obj)
+
+    bpy.context.view_layer.objects.active = mesh_obj
+    mesh_obj.select_set(True)
+    bpy.ops.object.shade_smooth()
+    mesh_obj.select_set(False)
+
+    return mesh_obj, center
+
+
+def load_vdb_volume(sample_id):
+    """
+    Load VDB written by export_to_vdb_shards.py:
+
+        volumes/vdb/volume_000001.vdb
+    """
+    vdb_path = VDB_DIR / f"volume_{sample_id:06d}.vdb"
+
+    if not vdb_path.is_file():
+        raise FileNotFoundError(f"VDB not found: {vdb_path}")
+
+    bpy.ops.object.volume_import(filepath=str(vdb_path))
+
+    volume_obj = bpy.context.object
+    volume_obj.name = f"volume_{sample_id:06d}"
+
+    return volume_obj
+
+
+# ============================================================
+# CAMERA DISTRIBUTION
+# ============================================================
+
+def fibonacci_sphere_directions(num_views):
+    """
+    Approximate uniform directions on the sphere.
+
+    Better coverage than independent random views when using only 16 cameras.
+    """
+    directions = []
+    golden_angle = math.pi * (3.0 - math.sqrt(5.0))
+
+    for i in range(num_views):
+        z = 1.0 - 2.0 * ((i + 0.5) / num_views)
+        radius_xy = math.sqrt(max(0.0, 1.0 - z * z))
+        angle = golden_angle * i
+
+        x = radius_xy * math.cos(angle)
+        y = radius_xy * math.sin(angle)
+
+        directions.append(np.array([x, y, z], dtype=np.float64))
+
+    return directions
+
+
+def random_rotation_matrix(rng):
+    """
+    Uniform random 3D rotation.
+
+    Each volume receives a deterministic rotation of the base camera pattern.
+    """
+    u1, u2, u3 = rng.uniform(0.0, 1.0, size=3)
+
+    qx = math.sqrt(1.0 - u1) * math.sin(2.0 * math.pi * u2)
+    qy = math.sqrt(1.0 - u1) * math.cos(2.0 * math.pi * u2)
+    qz = math.sqrt(u1) * math.sin(2.0 * math.pi * u3)
+    qw = math.sqrt(u1) * math.cos(2.0 * math.pi * u3)
+
+    return np.array(
+        [
+            [
+                1.0 - 2.0 * (qy * qy + qz * qz),
+                2.0 * (qx * qy - qz * qw),
+                2.0 * (qx * qz + qy * qw),
+            ],
+            [
+                2.0 * (qx * qy + qz * qw),
+                1.0 - 2.0 * (qx * qx + qz * qz),
+                2.0 * (qy * qz - qx * qw),
+            ],
+            [
+                2.0 * (qx * qz - qy * qw),
+                2.0 * (qy * qz + qx * qw),
+                1.0 - 2.0 * (qx * qx + qy * qy),
+            ],
+        ],
+        dtype=np.float64,
+    )
+
+
+# ============================================================
+# SPHERICAL HARMONICS / ENVIRONMENT MAPS
+# ============================================================
+
 def sh_lm_list(order):
     pairs = []
+
     for l in range(order + 1):
         for m in range(-l, l + 1):
             pairs.append((l, m))
+
     return pairs
+
 
 def sh_basis_dir_l2(x, y, z):
     c0 = 0.28209479177387814
@@ -220,445 +586,869 @@ def sh_basis_dir_l2(x, y, z):
     c2 = 1.0925484305920792
     c3 = 0.31539156525252005
     c4 = 0.5462742152960396
+
     Y = np.empty(9, dtype=np.float32)
+
     Y[0] = c0
     Y[1] = -c1 * y
     Y[2] = c1 * z
     Y[3] = -c1 * x
     Y[4] = c2 * x * y
     Y[5] = -c2 * y * z
-    Y[6] = c3 * (3.0 * z*z - 1.0)
+    Y[6] = c3 * (3.0 * z * z - 1.0)
     Y[7] = -c2 * x * z
-    Y[8] = c4 * (x*x - y*y)
+    Y[8] = c4 * (x * x - y * y)
+
     return Y
 
-def env_from_sh(H, W, sh_coeffs):
-    H = int(H); W = int(W)
-    env = np.zeros((H, W, 3), dtype=np.float32)
-    dtheta = math.pi / H
-    dphi   = 2.0 * math.pi / W
-    for y in range(H):
-        theta = (y + 0.5) * dtheta
+
+def env_from_sh(height, width, sh_coeffs):
+    """Create an RGB latitude-longitude environment map from SH coefficients."""
+    env = np.zeros((height, width, 3), dtype=np.float32)
+
+    dtheta = math.pi / height
+    dphi = 2.0 * math.pi / width
+
+    for row in range(height):
+        theta = (row + 0.5) * dtheta
         sin_theta = math.sin(theta)
-        ct = math.cos(theta)
-        for x in range(W):
-            phi = (x + 0.5) * dphi
-            cp = math.cos(phi)
-            sp = math.sin(phi)
-            vx = sin_theta * cp
-            vy = sin_theta * sp
-            vz = ct
-            Y = sh_basis_dir_l2(vx, vy, vz)
-            rgb = (sh_coeffs.T @ Y).astype(np.float32)
-            env[y, x, :] = rgb
+        cos_theta = math.cos(theta)
+
+        for col in range(width):
+            phi = (col + 0.5) * dphi
+
+            x = sin_theta * math.cos(phi)
+            y = sin_theta * math.sin(phi)
+            z = cos_theta
+
+            basis = sh_basis_dir_l2(x, y, z)
+            env[row, col] = (sh_coeffs.T @ basis).astype(np.float32)
+
     env -= env.min()
-    if env.max() > 0:
+
+    if env.max() > 0.0:
         env /= env.max()
+
     return env
 
+
 def sh_for_global_env(env_id, order=2):
+    """Generate deterministic SH coefficients for environment env_id."""
     pairs = sh_lm_list(order)
-    num_coeffs = len(pairs)
-    coeffs = np.zeros((num_coeffs, 3), dtype=np.float32)
+    coeffs = np.zeros((len(pairs), 3), dtype=np.float32)
+
     u = env_id / max(1.0, float(NUM_GLOBAL_ENVS - 1))
     t = 2.0 * math.pi * u
+
     r = 0.5 + 0.4 * math.sin(t)
     g = 0.5 + 0.4 * math.sin(t + 2.0 * math.pi / 3.0)
     b = 0.5 + 0.4 * math.sin(t + 4.0 * math.pi / 3.0)
+
     rgb = np.array([r, g, b], dtype=np.float32)
     gray = np.full(3, rgb.mean(), dtype=np.float32)
-    if u < 1.0/3.0:
-        alpha = 0.1
-    elif u < 2.0/3.0:
-        alpha = 0.5
+
+    if u < 1.0 / 3.0:
+        saturation = 0.1
+    elif u < 2.0 / 3.0:
+        saturation = 0.5
     else:
-        alpha = 1.0
-    rgb_scale = (1.0 - alpha) * gray + alpha * rgb
-    coeffs[0, :] = rgb_scale * 0.4
+        saturation = 1.0
+
+    rgb_scale = (1.0 - saturation) * gray + saturation * rgb
+
+    coeffs[0] = rgb_scale * 0.4
+
     for idx, (l, m) in enumerate(pairs):
         if l == 1:
             if m == -1:
-                coeffs[idx, :] = rgb_scale * (0.2 * math.sin(2.0 * math.pi * u))
+                coeffs[idx] = rgb_scale * (
+                    0.2 * math.sin(2.0 * math.pi * u)
+                )
             elif m == 0:
-                coeffs[idx, :] = rgb_scale * (0.2 * math.cos(2.0 * math.pi * u))
+                coeffs[idx] = rgb_scale * (
+                    0.2 * math.cos(2.0 * math.pi * u)
+                )
             elif m == 1:
-                coeffs[idx, :] = rgb_scale * (0.2 * math.sin(2.0 * math.pi * u + 1.0))
-    for idx, (l, m) in enumerate(pairs):
-        if l == 2 and m == 0:
-            coeffs[idx, :] += rgb_scale * (0.05 * math.cos(4.0 * math.pi * u))
+                coeffs[idx] = rgb_scale * (
+                    0.2 * math.sin(2.0 * math.pi * u + 1.0)
+                )
+
+        elif l == 2 and m == 0:
+            coeffs[idx] += rgb_scale * (
+                0.05 * math.cos(4.0 * math.pi * u)
+            )
+
     return coeffs
 
+
+def save_envmap(env, filepath):
+    filepath = Path(filepath)
+    filepath.parent.mkdir(parents=True, exist_ok=True)
+
+    env_u8 = np.clip(env, 0.0, 1.0)
+    env_u8 = (env_u8 * 255.0).astype(np.uint8)
+
+    imageio.imwrite(filepath, env_u8)
+
+
 def set_env_texture(scene, image_path, strength=1.0):
+    """Set Blender world to an environment texture."""
     world = scene.world
+
     if world is None:
         world = bpy.data.worlds.new("World")
         scene.world = world
+
     world.use_nodes = True
-    nt = world.node_tree
-    nodes = nt.nodes
-    links = nt.links
-    for n in list(nodes):
-        nodes.remove(n)
-    world_output = nodes.new("ShaderNodeOutputWorld")
-    world_output.location = (300, 0)
-    bg = nodes.new("ShaderNodeBackground")
-    bg.location = (0, 0)
-    env_tex = nodes.new("ShaderNodeTexEnvironment")
-    env_tex.location = (-300, 0)
-    img = bpy.data.images.load(image_path)
-    env_tex.image = img
-    bg.inputs["Strength"].default_value = strength
-    links.new(env_tex.outputs["Color"], bg.inputs["Color"])
-    links.new(bg.outputs["Background"], world_output.inputs["Surface"])
 
-def save_envmap(env, filepath):
-    os.makedirs(os.path.dirname(filepath), exist_ok=True)
-    env8 = np.clip(env, 0.0, 1.0)
-    env8 = (env8 * 255.0).astype(np.uint8)
-    imageio.imwrite(filepath, env8)
+    nodes = world.node_tree.nodes
+    links = world.node_tree.links
 
-# ==============================
+    for node in list(nodes):
+        nodes.remove(node)
+
+    output_node = nodes.new("ShaderNodeOutputWorld")
+    output_node.location = (300, 0)
+
+    background = nodes.new("ShaderNodeBackground")
+    background.location = (0, 0)
+    background.inputs["Strength"].default_value = float(strength)
+
+    environment = nodes.new("ShaderNodeTexEnvironment")
+    environment.location = (-300, 0)
+
+    image = bpy.data.images.load(
+        str(image_path),
+        check_existing=True,
+    )
+    environment.image = image
+
+    links.new(environment.outputs["Color"], background.inputs["Color"])
+    links.new(background.outputs["Background"], output_node.inputs["Surface"])
+
+
+# ============================================================
+# DATASET SELECTION
+# ============================================================
+
+def select_geometry_rows(all_rows, target_num_geometries, seed):
+    """
+    Select geometry IDs, retaining every sigma volume for each selected geometry.
+
+    This expects the sharded volume generator metadata to include:
+
+        geometry_id
+        sample_id
+        sigma
+    """
+    groups = {}
+
+    for row in all_rows:
+        geometry_id = int(row["geometry_id"])
+        groups.setdefault(geometry_id, []).append(row)
+
+    geometry_ids = sorted(groups.keys())
+
+    if target_num_geometries is None:
+        selected_geometry_ids = geometry_ids
+    else:
+        target_num_geometries = min(
+            int(target_num_geometries),
+            len(geometry_ids),
+        )
+
+        rng = np.random.RandomState(seed)
+
+        selected_indices = rng.choice(
+            len(geometry_ids),
+            size=target_num_geometries,
+            replace=False,
+        )
+
+        selected_geometry_ids = [
+            geometry_ids[i]
+            for i in sorted(selected_indices)
+        ]
+
+    selected_rows = []
+
+    for geometry_id in selected_geometry_ids:
+        geometry_rows = groups[geometry_id]
+
+        # Stable sigma/sample ordering.
+        geometry_rows = sorted(
+            geometry_rows,
+            key=lambda row: (
+                float(row["sigma"]),
+                int(row["sample_id"]),
+            ),
+        )
+
+        selected_rows.extend(geometry_rows)
+
+    selected_rows.sort(key=lambda row: int(row["sample_id"]))
+
+    return selected_rows, len(selected_geometry_ids)
+
+
+# ============================================================
+# RENDER / SHARD HELPERS
+# ============================================================
+
+def render_rgba(scene, filepath):
+    """Render a PNG, read it as float32 RGBA, then delete temp file."""
+    scene.render.filepath = str(filepath)
+    bpy.ops.render.render(write_still=True)
+
+    image = imageio.imread(filepath).astype(np.float32) / 255.0
+
+    if filepath.is_file():
+        filepath.unlink()
+
+    return image
+
+
+def render_surface_mask(
+    scene,
+    mesh_obj,
+    volume_obj,
+    mask_material,
+    temp_dir,
+    job_id,
+    sample_id,
+    view_idx,
+):
+    """Render opaque mesh silhouette and return alpha [H, W]."""
+    mesh_obj.data.materials.clear()
+    mesh_obj.data.materials.append(mask_material)
+
+    mesh_obj.hide_render = False
+
+    if volume_obj is not None:
+        volume_obj.hide_render = True
+
+    set_black_world(scene)
+
+    mask_path = temp_dir / (
+        f"mask_{job_id}_{os.getpid()}_"
+        f"s{sample_id:06d}_v{view_idx:03d}.png"
+    )
+
+    image = render_rgba(scene, mask_path)
+
+    mesh_obj.data.materials.clear()
+
+    if image.ndim != 3 or image.shape[2] < 4:
+        print(
+            f"[WARN] Mask failure: sample_id={sample_id}, "
+            f"view={view_idx}, shape={image.shape}"
+        )
+        return None
+
+    return image[:, :, 3]
+
+
+def save_shard(
+    rgb_array,
+    alpha_array,
+    rgb_rows,
+    alpha_rows,
+    count,
+    job_id,
+    local_shard_id,
+):
+    """Save one RGB shard, one alpha shard, and their metadata CSVs."""
+    if count <= 0:
+        return
+
+    shard_tag = f"{job_id}_shard_{local_shard_id:04d}"
+
+    rgb_path = RENDER_DIR / (
+        f"images_{RES_X}x{RES_Y}_{shard_tag}.npy"
+    )
+    np.save(rgb_path, rgb_array[:count])
+
+    rgb_csv = RENDER_DIR / f"metadata_{shard_tag}.csv"
+    pd.DataFrame(rgb_rows).to_csv(rgb_csv, index=False)
+
+    alpha_path = ALPHA_DIR / (
+        f"alpha_{RES_X}x{RES_Y}_{shard_tag}.npy"
+    )
+    np.save(alpha_path, alpha_array[:count])
+
+    alpha_csv = ALPHA_DIR / f"metadata_alpha_{shard_tag}.csv"
+    pd.DataFrame(alpha_rows).to_csv(alpha_csv, index=False)
+
+    print(f"Saved RGB shard: {rgb_path}")
+    print(f"Saved RGB metadata: {rgb_csv}")
+    print(f"Saved alpha shard: {alpha_path}")
+    print(f"Saved alpha metadata: {alpha_csv}")
+
+
+# ============================================================
 # MAIN
-# ==============================
+# ============================================================
 
 def main():
-    start_id = None
-    end_id = None
+    # Slurm array settings.
+    task_id = 0
+    num_tasks = 1
     job_id = "job0"
-    temp_dir = os.path.join(RENDER_DIR, f"_tmp_{job_id}")
-    os.makedirs(temp_dir, exist_ok=True)
+
+    # Optional test override.
+    max_geometries = None
 
     argv = sys.argv[sys.argv.index("--") + 1:] if "--" in sys.argv else []
-    if "--start_id" in argv:
-        start_id = int(argv[argv.index("--start_id") + 1])
-    if "--end_id" in argv:
-        end_id = int(argv[argv.index("--end_id") + 1])
+
+    if "--task_id" in argv:
+        task_id = int(argv[argv.index("--task_id") + 1])
+
+    if "--num_tasks" in argv:
+        num_tasks = int(argv[argv.index("--num_tasks") + 1])
+
     if "--job_id" in argv:
         job_id = argv[argv.index("--job_id") + 1]
 
-    shard_base = 0
-    if "--shard_base" in argv:
-        shard_base = int(argv[argv.index("--shard_base") + 1])
+    if "--max_geometries" in argv:
+        max_geometries = int(argv[argv.index("--max_geometries") + 1])
+
+    if num_tasks <= 0:
+        raise ValueError(f"num_tasks must be positive, got {num_tasks}")
+
+    if not (0 <= task_id < num_tasks):
+        raise ValueError(
+            f"task_id must be in [0, {num_tasks - 1}], got {task_id}"
+        )
+
+    if not VOLUME_METADATA_CSV.is_file():
+        raise FileNotFoundError(
+            f"Metadata CSV not found: {VOLUME_METADATA_CSV}"
+        )
+
+    temp_dir = RENDER_DIR / f"_tmp_{job_id}"
+    temp_dir.mkdir(parents=True, exist_ok=True)
+
+    # --------------------------------------------------------
+    # Blender setup
+    # --------------------------------------------------------
 
     scene = bpy.context.scene
     clean_scene()
 
-    scene.render.engine = 'CYCLES'
-    scene.cycles.device = 'CPU'
+    scene.render.engine = "CYCLES"
+    scene.cycles.device = "CPU"
     scene.cycles.samples = SAMPLES
+
     scene.render.resolution_x = RES_X
     scene.render.resolution_y = RES_Y
-    scene.view_settings.view_transform = 'Filmic'
-    scene.view_settings.look = 'None'
+    scene.render.resolution_percentage = 100
+
+    scene.render.image_settings.file_format = "PNG"
+    scene.render.image_settings.color_mode = "RGBA"
+    scene.render.image_settings.color_depth = "8"
+
+    # Needed for alpha channels.
+    scene.render.film_transparent = True
+
+    scene.view_settings.view_transform = "Filmic"
+    scene.view_settings.look = "None"
     scene.view_settings.exposure = 0.0
     scene.view_settings.gamma = 1.0
-    scene.cycles.transparent_max_bounces = 8
 
+    scene.cycles.transparent_max_bounces = 8
     scene.cycles.volume_step_rate = 0.5
     scene.cycles.volume_max_steps = 1024
 
-    scene.render.image_settings.color_mode = 'RGBA'
-    scene.render.film_transparent = True
+    set_black_world(scene)
 
-    setup_world_and_lighting(scene)
+    # Reusable materials prevent per-frame Blender datablock growth.
+    surface_material = make_surface_material()
+    volume_material = make_volume_material()
+    mask_material = make_mask_material()
 
-    # Mask material (for silhouette renders in surface mode)
-    mask_mat = make_mask_material()
+    # --------------------------------------------------------
+    # Environment maps
+    # --------------------------------------------------------
 
-    # Precompute env SH + envmaps
     global_env_sh = {}
     global_env_path = {}
+
     for env_id in range(NUM_GLOBAL_ENVS):
         sh_coeffs = sh_for_global_env(env_id, order=SH_ORDER)
         env = env_from_sh(ENV_H, ENV_W, sh_coeffs)
-        env_name = f"env_e{env_id:03d}.png"
-        env_path = os.path.join(ENV_DIR, env_name)
-        if not os.path.exists(env_path):
+
+        env_path = ENV_DIR / f"env_e{env_id:03d}.png"
+
+        if not env_path.is_file():
             save_envmap(env, env_path)
+
         global_env_sh[env_id] = sh_coeffs
         global_env_path[env_id] = env_path
 
-    # read volume metadata
+    # --------------------------------------------------------
+    # Read and select geometry groups
+    # --------------------------------------------------------
+
     with open(VOLUME_METADATA_CSV, "r", newline="") as f:
-        vol_reader = csv.DictReader(f)
-        vol_rows = [row for row in vol_reader]
+        all_rows = list(csv.DictReader(f))
 
-    if start_id is not None or end_id is not None:
-        filtered = []
-        for row in vol_rows:
-            sid = int(row["sample_id"])
-            if (start_id is None or sid >= start_id) and (end_id is None or sid <= end_id):
-                filtered.append(row)
-        vol_rows = filtered
-        print(f"Processing sample_id in [{start_id}, {end_id}], count={len(vol_rows)}")
+    required_fields = {"sample_id", "geometry_id", "mesh_path", "sigma"}
+    missing_fields = required_fields - set(all_rows[0].keys())
 
-    H, W = RES_Y, RES_X
+    if missing_fields:
+        raise KeyError(
+            "Metadata is missing required columns: "
+            f"{sorted(missing_fields)}"
+        )
 
-    current_shard_id = 0
+    requested_geometries = (
+        max_geometries
+        if max_geometries is not None
+        else TARGET_NUM_GEOMETRIES
+    )
+
+    selected_rows, selected_geometry_count = select_geometry_rows(
+        all_rows=all_rows,
+        target_num_geometries=requested_geometries,
+        seed=GEOMETRY_SELECTION_SEED,
+    )
+
+    # Evenly distribute rows over Slurm tasks.
+    #
+    # Does not assume sample IDs are contiguous.
+    task_rows = selected_rows[task_id::num_tasks]
+
+    num_modes = int(RENDER_SURFACE) + int(RENDER_VOLUME)
+
+    print("=" * 72)
+    print("Balanced implicit B-spline renderer")
+    print(f"Selected geometries: {selected_geometry_count:,}")
+    print(f"Selected volume samples: {len(selected_rows):,}")
+    print(f"Task ID: {task_id}/{num_tasks - 1}")
+    print(f"Volumes assigned to task: {len(task_rows):,}")
+    print(f"Views per volume: {NUM_VIEWS_PER_VOLUME}")
+    print(f"Render modes per view: {num_modes}")
+    print(
+        f"Expected images for task: "
+        f"{len(task_rows) * NUM_VIEWS_PER_VOLUME * num_modes:,}"
+    )
+    print("=" * 72)
+
+    if not task_rows:
+        print("No samples assigned to this task.")
+        return
+
+    # --------------------------------------------------------
+    # Output buffers
+    # --------------------------------------------------------
+
+    rgb_shard = np.empty(
+        (SHARD_SIZE, 3, RES_Y, RES_X),
+        dtype=np.float32,
+    )
+
+    alpha_shard = np.empty(
+        (SHARD_SIZE, RES_Y, RES_X),
+        dtype=np.float32,
+    )
+
+    rgb_metadata_rows = []
+    alpha_metadata_rows = []
+
     current_shard_count = 0
-    shard_array = np.empty((SHARD_SIZE, 3, H, W), dtype=np.float32)
-    rows = []
-
-    alpha_shard_array = np.empty((ALPHA_SHARD_SIZE, H, W), dtype=np.float32)
-    alpha_rows = []
+    local_shard_id = 0
 
     sh_pairs = sh_lm_list(SH_ORDER)
+    base_directions = fibonacci_sphere_directions(NUM_VIEWS_PER_VOLUME)
 
-    for vol_row in vol_rows:
-        sample_id   = int(vol_row["sample_id"])
-        mesh_path   = vol_row["mesh_path"]
-        coeff_path  = vol_row["coeff_path"]
-        volume_path = vol_row["volume_path"]
+    # --------------------------------------------------------
+    # Frame writing helper
+    # --------------------------------------------------------
 
-        # remove existing non-light, non-camera objects
-        for o in list(bpy.data.objects):
-            if o.type not in {'LIGHT', 'CAMERA'}:
-                bpy.data.objects.remove(o, do_unlink=True)
+    def add_frame(
+        rgb,
+        alpha,
+        metadata_row,
+        alpha_metadata_row,
+    ):
+        nonlocal current_shard_count
+        nonlocal local_shard_id
+        nonlocal rgb_metadata_rows
+        nonlocal alpha_metadata_rows
 
-        # ---- load mesh (surface mode) ----
-        full_mesh_path = os.path.abspath(mesh_path)
-        data = np.load(full_mesh_path)
-        verts = data["verts"].astype(np.float32)
-        faces = data["faces"]
+        if rgb.shape != (RES_Y, RES_X, 3):
+            raise ValueError(f"Unexpected RGB shape: {rgb.shape}")
 
-        vmin = verts.min(axis=0)
-        vmax = verts.max(axis=0)
-        center = 0.5 * (vmin + vmax)
-        verts_centered = verts - center
+        if alpha.shape != (RES_Y, RES_X):
+            raise ValueError(f"Unexpected alpha shape: {alpha.shape}")
 
-        mesh = bpy.data.meshes.new(f"mesh_{sample_id:04d}")
-        mesh.from_pydata(verts_centered.tolist(), [], faces.tolist())
-        mesh.update()
-        mesh_obj = bpy.data.objects.new(mesh.name, mesh)
-        scene.collection.objects.link(mesh_obj)
-        mesh_obj.name = f"shape_mesh_{sample_id:04d}"
+        rgb_shard[current_shard_count] = np.transpose(rgb, (2, 0, 1))
+        alpha_shard[current_shard_count] = alpha
 
-        bpy.context.view_layer.objects.active = mesh_obj
-        mesh_obj.select_set(True)
-        bpy.ops.object.shade_smooth()
-        mesh_obj.select_set(False)
+        metadata_row["shard_id"] = f"{job_id}_{local_shard_id}"
+        metadata_row["idx_in_shard"] = current_shard_count
 
-        # ---- load VDB volume (volume mode) ----
+        alpha_metadata_row["alpha_shard_id"] = (
+            f"{job_id}_{local_shard_id}"
+        )
+        alpha_metadata_row["idx_in_alpha_shard"] = current_shard_count
+        alpha_metadata_row["img_shard_id"] = f"{job_id}_{local_shard_id}"
+        alpha_metadata_row["idx_in_img_shard"] = current_shard_count
+
+        rgb_metadata_rows.append(metadata_row)
+        alpha_metadata_rows.append(alpha_metadata_row)
+
+        current_shard_count += 1
+
+        if current_shard_count >= SHARD_SIZE:
+            save_shard(
+                rgb_array=rgb_shard,
+                alpha_array=alpha_shard,
+                rgb_rows=rgb_metadata_rows,
+                alpha_rows=alpha_metadata_rows,
+                count=current_shard_count,
+                job_id=job_id,
+                local_shard_id=local_shard_id,
+            )
+
+            local_shard_id += 1
+            current_shard_count = 0
+            rgb_metadata_rows = []
+            alpha_metadata_rows = []
+
+    # --------------------------------------------------------
+    # Main loop
+    # --------------------------------------------------------
+
+    for row_index, row in enumerate(task_rows, start=1):
+        sample_id = int(row["sample_id"])
+        geometry_id = int(row["geometry_id"])
+
+        mesh_path = row["mesh_path"]
+        sigma = float(row["sigma"])
+
+        clear_shape_objects()
+
+        # ---- Load mesh ----
         try:
-            vol_obj = load_vdb_volume(sample_id, volume_path)
-            vol_obj.location = (-center[0], -center[1], -center[2])
-        except FileNotFoundError as e:
-            print("[WARN]", e)
-            vol_obj = None
+            mesh_obj, mesh_center = load_mesh_object(
+                sample_id=sample_id,
+                mesh_path_from_csv=mesh_path,
+            )
+        except Exception as exc:
+            print(
+                f"[WARN] sample_id={sample_id}: mesh loading failed: {exc}"
+            )
+            continue
 
-        # ---- create an empty at origin and a camera that tracks it ----
-        origin_empty = bpy.data.objects.new(f"origin_{sample_id:04d}", None)
-        origin_empty.location = (0.0, 0.0, 0.0)
-        scene.collection.objects.link(origin_empty)
+        # ---- Load VDB ----
+        try:
+            volume_obj = load_vdb_volume(sample_id)
 
-        for o in list(bpy.data.objects):
-            if o.type == 'CAMERA':
-                bpy.data.objects.remove(o, do_unlink=True)
-        cam = create_camera(scene, origin_empty)
+            # Mesh was centered by subtracting mesh_center.
+            # Apply identical translation to VDB.
+            volume_obj.location = (
+                -float(mesh_center[0]),
+                -float(mesh_center[1]),
+                -float(mesh_center[2]),
+            )
 
-        rng = np.random.RandomState(sample_id)
+        except Exception as exc:
+            print(
+                f"[WARN] sample_id={sample_id}: VDB loading failed: {exc}"
+            )
+            volume_obj = None
 
-        for img_idx in range(IMAGES_PER_SHAPE):
-            # 3) camera pose (set first so both mask & main use same pose)
-            radius = 2.2
-            phi    = float(rng.uniform(0.0, math.pi))
-            theta  = float(rng.uniform(0.0, 2.0 * math.pi))
-            set_camera_from_spherical(cam, radius, phi, theta)
+        # ---- Camera target ----
+        origin = bpy.data.objects.new(
+            f"origin_{sample_id:06d}",
+            None,
+        )
+        origin.location = (0.0, 0.0, 0.0)
+        scene.collection.objects.link(origin)
 
-            # 2) material + mode
-            base_rgb = rng.uniform(0.02, 1.0, size=3)
-            metallic   = float(rng.choice([0.0, 1.0]))
-            roughness  = float(rng.uniform(0.1, 0.9))
-            specular   = 0.5
-            opacity    = float(rng.uniform(0.1, 1.0))
+        camera = create_camera(scene, origin)
 
-            if vol_obj is not None:
-                render_mode = rng.choice(["surface", "volume"])
-            else:
-                render_mode = "surface"
+        # Reproducibly rotate the 16-view pattern per volume sample.
+        view_rng = np.random.RandomState(sample_id + 10_000_019)
+        rotation = random_rotation_matrix(view_rng)
 
-            # ---- mask render for surface mode ----
-            mask_alpha = None
-            if render_mode == "surface":
-                # mesh only, mask material
-                mesh_obj.data.materials.clear()
-                mesh_obj.data.materials.append(mask_mat)
-                mesh_obj.hide_render = False
-                if vol_obj is not None:
-                    vol_obj.hide_render = True
+        rotated_directions = [
+            rotation @ direction
+            for direction in base_directions
+        ]
 
-                # simple black world for mask
-                setup_world_and_lighting(scene)
+        for view_idx, direction in enumerate(rotated_directions):
+            set_camera_from_direction(
+                camera,
+                direction=direction,
+                radius=CAMERA_RADIUS,
+            )
 
-                pid = os.getpid()
-                tmp_mask_name = f"_tmpmask_{job_id}_{pid}_s{sample_id:04d}_i{img_idx:05d}.png"
-                tmp_mask_path = os.path.join(temp_dir, tmp_mask_name)
+            phi, theta = direction_to_phi_theta(direction)
 
-                scene.render.filepath = tmp_mask_path
-                scene.render.use_file_extension = True
-                bpy.ops.render.render(write_still=True)
+            # Deterministic but distinct appearance sampling per sample/view.
+            appearance_rng = np.random.RandomState(
+                sample_id * 100_003 + view_idx * 101
+            )
 
-                mask_img = imageio.imread(tmp_mask_path).astype(np.float32) / 255.0
-                os.remove(tmp_mask_path)
+            # ====================================================
+            # SURFACE MODE
+            # ====================================================
 
-                if mask_img.ndim == 3 and mask_img.shape[2] >= 4:
-                    mask_alpha = mask_img[:, :, 3]  # [H,W]
-                else:
-                    print(f"[WARN] Mask render missing alpha, shape={mask_img.shape}")
-                    mask_alpha = None
+            if RENDER_SURFACE:
+                base_rgb = appearance_rng.uniform(0.02, 1.0, size=3)
 
-            # 1) env (for main render)
-            env_id = int(rng.randint(0, NUM_GLOBAL_ENVS))
-            sh_coeffs = global_env_sh[env_id]
-            env_path  = global_env_path[env_id]
-            set_env_texture(scene, env_path, strength=1.0)
-
-            # assign real materials for main render
-            if render_mode == "surface":
-                mat, base_color, material_type = make_material_from_params(
-                    base_rgb, metallic, roughness, specular, opacity
+                metallic = float(appearance_rng.choice([0.0, 1.0]))
+                roughness = float(appearance_rng.uniform(0.1, 0.9))
+                specular = 0.5
+                opacity = float(
+                    appearance_rng.uniform(MIN_OPACITY, MAX_OPACITY)
                 )
+
+                env_id = int(
+                    appearance_rng.randint(0, NUM_GLOBAL_ENVS)
+                )
+                sh_coeffs = global_env_sh[env_id]
+                env_path = global_env_path[env_id]
+
+                mask_alpha = render_surface_mask(
+                    scene=scene,
+                    mesh_obj=mesh_obj,
+                    volume_obj=volume_obj,
+                    mask_material=mask_material,
+                    temp_dir=temp_dir,
+                    job_id=job_id,
+                    sample_id=sample_id,
+                    view_idx=view_idx,
+                )
+
+                set_env_texture(scene, env_path, strength=1.0)
+
+                base_color, material_type = update_surface_material(
+                    material=surface_material,
+                    rgb=base_rgb,
+                    metallic=metallic,
+                    roughness=roughness,
+                    specular=specular,
+                    opacity=opacity,
+                )
+
                 mesh_obj.data.materials.clear()
-                mesh_obj.data.materials.append(mat)
+                mesh_obj.data.materials.append(surface_material)
                 mesh_obj.hide_render = False
-                if vol_obj is not None:
-                    vol_obj.hide_render = True
-            else:  # volume
-                density_scale = 0.05 + 0.95 * opacity
-                mat, base_color = make_volume_material_from_params(base_rgb, density_scale)
-                if vol_obj is not None:
-                    vol_obj.data.materials.clear()
-                    vol_obj.data.materials.append(mat)
-                    vol_obj.hide_render = False
-                material_type = "volume"
+
+                if volume_obj is not None:
+                    volume_obj.hide_render = True
+
+                image_path = temp_dir / (
+                    f"surface_{job_id}_{os.getpid()}_"
+                    f"s{sample_id:06d}_v{view_idx:03d}.png"
+                )
+
+                image = render_rgba(scene, image_path)
+
+                mesh_obj.data.materials.clear()
+
+                if (
+                    image.ndim == 3
+                    and image.shape == (RES_Y, RES_X, 4)
+                ):
+                    rgb = image[:, :, :3]
+
+                    if mask_alpha is not None:
+                        alpha = (mask_alpha * opacity).astype(np.float32)
+                    else:
+                        alpha = image[:, :, 3]
+
+                    metadata_row = {
+                        "sample_id": sample_id,
+                        "geometry_id": geometry_id,
+                        "mesh_path": mesh_path,
+                        "sigma": sigma,
+                        "render_mode": "surface",
+                        "view_idx": view_idx,
+                        "env_id": env_id,
+                        "env_path": str(env_path),
+                        "metallic": metallic,
+                        "roughness": roughness,
+                        "specular": specular,
+                        "material_type": material_type,
+                        "base_color_r": float(base_color[0]),
+                        "base_color_g": float(base_color[1]),
+                        "base_color_b": float(base_color[2]),
+                        "opacity": opacity,
+                        "density_scale": np.nan,
+                        "phi": phi,
+                        "theta": theta,
+                        "radius": CAMERA_RADIUS,
+                    }
+
+                    alpha_metadata_row = {
+                        "sample_id": sample_id,
+                        "geometry_id": geometry_id,
+                        "mesh_path": mesh_path,
+                        "sigma": sigma,
+                        "render_mode": "surface",
+                        "view_idx": view_idx,
+                        "opacity": opacity,
+                        "density_scale": np.nan,
+                        "phi": phi,
+                        "theta": theta,
+                        "radius": CAMERA_RADIUS,
+                    }
+
+                    for sh_idx, (l, m) in enumerate(sh_pairs):
+                        r_coeff, g_coeff, b_coeff = sh_coeffs[sh_idx]
+
+                        metadata_row[f"sh_l{l}_m{m}_r"] = float(r_coeff)
+                        metadata_row[f"sh_l{l}_m{m}_g"] = float(g_coeff)
+                        metadata_row[f"sh_l{l}_m{m}_b"] = float(b_coeff)
+
+                    add_frame(
+                        rgb=rgb,
+                        alpha=alpha,
+                        metadata_row=metadata_row,
+                        alpha_metadata_row=alpha_metadata_row,
+                    )
+
+                else:
+                    print(
+                        f"[WARN] Bad surface image: "
+                        f"sample_id={sample_id}, view={view_idx}, "
+                        f"shape={image.shape}"
+                    )
+
+            # ====================================================
+            # VOLUME MODE
+            # ====================================================
+
+            if RENDER_VOLUME and volume_obj is not None:
+                base_rgb = appearance_rng.uniform(0.02, 1.0, size=3)
+
+                opacity = float(
+                    appearance_rng.uniform(MIN_OPACITY, MAX_OPACITY)
+                )
+
+                density_scale = density_scale_for_sigma(
+                    sigma=sigma,
+                    target_opacity=opacity,
+                )
+
+                env_id = int(
+                    appearance_rng.randint(0, NUM_GLOBAL_ENVS)
+                )
+                sh_coeffs = global_env_sh[env_id]
+                env_path = global_env_path[env_id]
+
+                set_env_texture(scene, env_path, strength=1.0)
+
+                base_color = update_volume_material(
+                    material=volume_material,
+                    rgb=base_rgb,
+                    density_scale=density_scale,
+                )
+
+                volume_obj.data.materials.clear()
+                volume_obj.data.materials.append(volume_material)
+
+                volume_obj.hide_render = False
                 mesh_obj.hide_render = True
 
-            # 4) main render to temp PNG
-            pid = os.getpid()
-            tmp_name = f"_tmp_{job_id}_{pid}_s{sample_id:04d}_i{img_idx:05d}.png"
-            tmp_path = os.path.join(temp_dir, tmp_name)
+                image_path = temp_dir / (
+                    f"volume_{job_id}_{os.getpid()}_"
+                    f"s{sample_id:06d}_v{view_idx:03d}.png"
+                )
 
-            scene.render.filepath = tmp_path
-            scene.render.use_file_extension = True
-            bpy.ops.render.render(write_still=True)
+                image = render_rgba(scene, image_path)
 
-            img = imageio.imread(tmp_path).astype(np.float32) / 255.0
-            os.remove(tmp_path)
+                volume_obj.data.materials.clear()
 
-            if img.ndim != 3 or img.shape[2] < 4:
-                print(f"[WARN] Expected RGBA, got shape {img.shape}; skipping frame")
-                continue
+                if (
+                    image.ndim == 3
+                    and image.shape == (RES_Y, RES_X, 4)
+                ):
+                    rgb = image[:, :, :3]
+                    alpha = image[:, :, 3]
 
-            rgb   = img[:, :, :3]
-            alpha = img[:, :, 3]
+                    metadata_row = {
+                        "sample_id": sample_id,
+                        "geometry_id": geometry_id,
+                        "mesh_path": mesh_path,
+                        "sigma": sigma,
+                        "render_mode": "volume",
+                        "view_idx": view_idx,
+                        "env_id": env_id,
+                        "env_path": str(env_path),
+                        "metallic": np.nan,
+                        "roughness": np.nan,
+                        "specular": np.nan,
+                        "material_type": "volume",
+                        "base_color_r": float(base_color[0]),
+                        "base_color_g": float(base_color[1]),
+                        "base_color_b": float(base_color[2]),
+                        "opacity": opacity,
+                        "density_scale": float(density_scale),
+                        "phi": phi,
+                        "theta": theta,
+                        "radius": CAMERA_RADIUS,
+                    }
 
-            # replace alpha with mask * opacity in surface mode
-            if render_mode == "surface" and mask_alpha is not None:
-                alpha = (mask_alpha * opacity).astype(np.float32)
+                    alpha_metadata_row = {
+                        "sample_id": sample_id,
+                        "geometry_id": geometry_id,
+                        "mesh_path": mesh_path,
+                        "sigma": sigma,
+                        "render_mode": "volume",
+                        "view_idx": view_idx,
+                        "opacity": opacity,
+                        "density_scale": float(density_scale),
+                        "phi": phi,
+                        "theta": theta,
+                        "radius": CAMERA_RADIUS,
+                    }
 
-            h, w, _ = rgb.shape
-            if h != RES_Y or w != RES_X:
-                print(f"[WARN] Got render size ({w},{h}), expected ({RES_X},{RES_Y}); skipping frame")
-                continue
+                    for sh_idx, (l, m) in enumerate(sh_pairs):
+                        r_coeff, g_coeff, b_coeff = sh_coeffs[sh_idx]
 
-            img_np = np.transpose(rgb, (2, 0, 1))
-            shard_array[current_shard_count] = img_np
-            alpha_shard_array[current_shard_count] = alpha
+                        metadata_row[f"sh_l{l}_m{m}_r"] = float(r_coeff)
+                        metadata_row[f"sh_l{l}_m{m}_g"] = float(g_coeff)
+                        metadata_row[f"sh_l{l}_m{m}_b"] = float(b_coeff)
 
-            row = {
-                "sample_id": sample_id,
-                "env_id": env_id,
-                "coeff_path": coeff_path,
-                "mesh_path": mesh_path,
-                "metallic": float(metallic),
-                "roughness": float(roughness),
-                "specular": float(specular),
-                "material_type": material_type,
-                "base_color_r": float(base_color[0]),
-                "base_color_g": float(base_color[1]),
-                "base_color_b": float(base_color[2]),
-                "opacity": float(opacity),
-                "phi": float(phi),
-                "theta": float(theta),
-                "radius": float(radius),
-                "env_path": env_path,
-                "shard_id": f"{job_id}_{shard_base + current_shard_id}",
-                "idx_in_shard": current_shard_count,
-                "render_mode": render_mode,
-            }
-            for idx_sh, (l, m) in enumerate(sh_pairs):
-                r_c, g_c, b_c = sh_coeffs[idx_sh]
-                row[f"sh_l{l}_m{m}_r"] = float(r_c)
-                row[f"sh_l{l}_m{m}_g"] = float(g_c)
-                row[f"sh_l{l}_m{m}_b"] = float(b_c)
+                    add_frame(
+                        rgb=rgb,
+                        alpha=alpha,
+                        metadata_row=metadata_row,
+                        alpha_metadata_row=alpha_metadata_row,
+                    )
 
-            rows.append(row)
+                else:
+                    print(
+                        f"[WARN] Bad volume image: "
+                        f"sample_id={sample_id}, view={view_idx}, "
+                        f"shape={image.shape}"
+                    )
 
-            alpha_row = {
-                "sample_id": sample_id,
-                "env_id": env_id,
-                "coeff_path": coeff_path,
-                "volume_path": volume_path,
-                "mesh_path": mesh_path,
-                "phi": float(phi),
-                "theta": float(theta),
-                "radius": float(radius),
-                "render_mode": render_mode,
-                "alpha_shard_id": f"{job_id}_{shard_base + current_shard_id}",
-                "idx_in_alpha_shard": current_shard_count,
-                "img_shard_id": f"{job_id}_{shard_base + current_shard_id}",
-                "idx_in_img_shard": current_shard_count,
-            }
-            alpha_rows.append(alpha_row)
+        print(
+            f"[{row_index}/{len(task_rows)}] completed "
+            f"sample_id={sample_id}, geometry_id={geometry_id}, "
+            f"sigma={sigma:.4f}"
+        )
 
-            current_shard_count += 1
-
-            if current_shard_count == SHARD_SIZE:
-                shard_name = f"images_64x64_{job_id}_shard_{shard_base + current_shard_id:03d}.npy"
-                shard_path = Path(RENDER_DIR) / shard_name
-                np.save(shard_path, shard_array[:current_shard_count])
-                print("Saved RGB shard:", shard_path)
-
-                rgb_csv_path = Path(RENDER_DIR) / f"metadata_{job_id}_shard_{shard_base + current_shard_id:03d}.csv"
-                pd.DataFrame(rows).to_csv(rgb_csv_path, index=False)
-                print("Saved RGB metadata:", rgb_csv_path)
-
-                alpha_shard_name = f"alpha_64x64_{job_id}_shard_{shard_base + current_shard_id:03d}.npy"
-                alpha_shard_path = Path(ALPHA_DIR) / alpha_shard_name
-                np.save(alpha_shard_path, alpha_shard_array[:current_shard_count])
-                print("Saved alpha shard:", alpha_shard_path)
-
-                alpha_csv_path = Path(ALPHA_DIR) / f"metadata_alpha_{job_id}_shard_{shard_base + current_shard_id:03d}.csv"
-                pd.DataFrame(alpha_rows).to_csv(alpha_csv_path, index=False)
-                print("Saved alpha metadata:", alpha_csv_path)
-
-                current_shard_id += 1
-                current_shard_count = 0
-                rows = []
-                alpha_rows = []
-
-        print("Finished shape", sample_id)
-
+    # Save partial final shard.
     if current_shard_count > 0:
-        shard_name = f"images_64x64_{job_id}_shard_{shard_base + current_shard_id:03d}.npy"
-        shard_path = Path(RENDER_DIR) / shard_name
-        np.save(shard_path, shard_array[:current_shard_count])
-        print("Saved final RGB shard:", shard_path)
-
-        rgb_csv_path = Path(RENDER_DIR) / f"metadata_{job_id}_shard_{shard_base + current_shard_id:03d}.csv"
-        pd.DataFrame(rows).to_csv(rgb_csv_path, index=False)
-        print("Saved RGB metadata:", rgb_csv_path)
-
-        alpha_shard_name = f"alpha_64x64_{job_id}_shard_{shard_base + current_shard_id:03d}.npy"
-        alpha_shard_path = Path(ALPHA_DIR) / alpha_shard_name
-        np.save(alpha_shard_path, alpha_shard_array[:current_shard_count])
-        print("Saved final alpha shard:", alpha_shard_path)
-
-        alpha_csv_path = Path(ALPHA_DIR) / f"metadata_alpha_{job_id}_shard_{shard_base + current_shard_id:03d}.csv"
-        pd.DataFrame(alpha_rows).to_csv(alpha_csv_path, index=False)
-        print("Saved alpha metadata:", alpha_csv_path)
+        save_shard(
+            rgb_array=rgb_shard,
+            alpha_array=alpha_shard,
+            rgb_rows=rgb_metadata_rows,
+            alpha_rows=alpha_metadata_rows,
+            count=current_shard_count,
+            job_id=job_id,
+            local_shard_id=local_shard_id,
+        )
 
     print("Done.")
+
 
 if __name__ == "__main__":
     main()

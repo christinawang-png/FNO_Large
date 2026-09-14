@@ -6,257 +6,394 @@ import csv
 import math
 from pathlib import Path
 
-# ==============================
+
+# ============================================================
 # CONFIGURATION
-# ==============================
+# ============================================================
 
 PROJECT_ROOT = Path(__file__).resolve().parent
-BASE_DIR     = PROJECT_ROOT / "plane_dataset_4"
 
-VOLUME_METADATA_CSV = str(BASE_DIR / "metadata_volumes.csv")
+BASE_DIR = PROJECT_ROOT / "implicit_bspline_dataset" / "volumes"
+VDB_DIR = BASE_DIR / "vdb"
+
+VOLUME_METADATA_CSV = BASE_DIR / "metadata_volumes.csv"
 
 RENDER_DIR = PROJECT_ROOT / "renders_preview_vdb"
-os.makedirs(RENDER_DIR, exist_ok=True)
+RENDER_DIR.mkdir(parents=True, exist_ok=True)
 
-RES_X = 64
-RES_Y = 64
-SAMPLES = 1024
+RES_X = 32
+RES_Y = 32
+SAMPLES = 100
 
-# fixed camera sphere pose
-RADIUS = 1.5
-PHI    = math.radians(55)    # elevation
-THETA  = math.radians(45)    # azimuth
+# Fixed camera pose.
+RADIUS = 2.3
+PHI = math.radians(55.0)
+THETA = math.radians(45.0)
 
-# name of the density grid in your VDBs (from export_to_vdb.py)
-VDB_GRID_NAME = "density"
+# Approximate opacity for a camera ray crossing the Gaussian sheet
+# approximately perpendicular to its surface.
+#
+# 0.05 = mostly transparent
+# 0.50 = half opaque
+# 0.95 = strongly opaque
+# 0.98 = nearly opaque
+TARGET_OPACITY = 0.98
 
-# ==============================
-# UTILITIES
-# ==============================
+# Must match the VDB export script.
+BAND_SIGMAS = 3.0
+
+
+# ============================================================
+# SCENE UTILITIES
+# ============================================================
 
 def clean_scene():
-    bpy.ops.object.select_all(action='SELECT')
+    """Remove all objects and unused Blender datablocks."""
+    bpy.ops.object.select_all(action="SELECT")
     bpy.ops.object.delete()
+
     for mesh in list(bpy.data.meshes):
         if not mesh.users:
             bpy.data.meshes.remove(mesh)
-    for vol in list(bpy.data.volumes):
-        if not vol.users:
-            bpy.data.volumes.remove(vol)
-    for mat in list(bpy.data.materials):
-        if not mat.users:
-            bpy.data.materials.remove(mat)
+
+    for volume in list(bpy.data.volumes):
+        if not volume.users:
+            bpy.data.volumes.remove(volume)
+
+    for material in list(bpy.data.materials):
+        if not material.users:
+            bpy.data.materials.remove(material)
+
+    for camera in list(bpy.data.cameras):
+        if not camera.users:
+            bpy.data.cameras.remove(camera)
+
     for light in list(bpy.data.lights):
         if not light.users:
             bpy.data.lights.remove(light)
 
-def setup_world_and_lighting(scene):
-    # simple dark world
+
+def remove_previous_volume_and_camera():
+    """Remove the prior preview volume/camera while preserving the world."""
+    for obj in list(bpy.data.objects):
+        bpy.data.objects.remove(obj, do_unlink=True)
+
+    for volume in list(bpy.data.volumes):
+        if not volume.users:
+            bpy.data.volumes.remove(volume)
+
+    for camera in list(bpy.data.cameras):
+        if not camera.users:
+            bpy.data.cameras.remove(camera)
+
+
+def setup_dark_world(scene):
+    """Use a dark neutral world for preview rendering."""
     world = bpy.data.worlds.new("World") if scene.world is None else scene.world
     scene.world = world
     world.use_nodes = True
+
     nodes = world.node_tree.nodes
     links = world.node_tree.links
-    for n in list(nodes):
-        nodes.remove(n)
-    out = nodes.new("ShaderNodeOutputWorld")
-    bg  = nodes.new("ShaderNodeBackground")
-    bg.inputs["Color"].default_value = (0.02, 0.02, 0.02, 1.0)
-    bg.inputs["Strength"].default_value = 1.0
-    links.new(bg.outputs["Background"], out.inputs["Surface"])
 
-    # remove any existing lights
-    for o in list(bpy.data.objects):
-        if o.type == 'LIGHT':
-            bpy.data.objects.remove(o, do_unlink=True)
+    for node in list(nodes):
+        nodes.remove(node)
 
-    # simple key light
-    key_data = bpy.data.lights.new(name="KeyLight", type='AREA')
-    key_data.energy = 1500.0
-    key_data.size   = 2.0
-    key_obj = bpy.data.objects.new("KeyLight", key_data)
-    scene.collection.objects.link(key_obj)
-    key_obj.location = (2.0, -2.0, 2.0)
-    key_obj.rotation_euler = (math.radians(60), 0.0, math.radians(45))
+    output_node = nodes.new("ShaderNodeOutputWorld")
+    background_node = nodes.new("ShaderNodeBackground")
 
-    # fill light
-    fill_data = bpy.data.lights.new(name="FillLight", type='AREA')
-    fill_data.energy = 600.0
-    fill_data.size   = 3.0
-    fill_obj = bpy.data.objects.new("FillLight", fill_data)
-    scene.collection.objects.link(fill_obj)
-    fill_obj.location = (-2.0, -1.0, 1.5)
-    fill_obj.rotation_euler = (math.radians(50), 0.0, math.radians(-30))
+    background_node.inputs["Color"].default_value = (
+        0.02,
+        0.02,
+        0.02,
+        1.0,
+    )
+    background_node.inputs["Strength"].default_value = 1.0
+
+    links.new(
+        background_node.outputs["Background"],
+        output_node.inputs["Surface"],
+    )
+
 
 def create_camera(scene, target_obj):
-    cam_data = bpy.data.cameras.new(name="Camera")
-    cam = bpy.data.objects.new("Camera", cam_data)
-    scene.collection.objects.link(cam)
-    scene.camera = cam
+    """Create a camera that tracks the volume object's origin."""
+    camera_data = bpy.data.cameras.new(name="Camera")
+    camera_obj = bpy.data.objects.new("Camera", camera_data)
 
-    con = cam.constraints.new(type='TRACK_TO')
-    con.target = target_obj
-    con.track_axis = 'TRACK_NEGATIVE_Z'
-    con.up_axis = 'UP_Y'
-    return cam
+    scene.collection.objects.link(camera_obj)
+    scene.camera = camera_obj
 
-def set_camera_from_spherical(cam, radius, phi, theta):
+    constraint = camera_obj.constraints.new(type="TRACK_TO")
+    constraint.target = target_obj
+    constraint.track_axis = "TRACK_NEGATIVE_Z"
+    constraint.up_axis = "UP_Y"
+
+    return camera_obj
+
+
+def set_camera_from_spherical(camera, radius, phi, theta):
+    """Set camera position using the project spherical-coordinate convention."""
     x = radius * math.sin(phi) * math.cos(theta)
     y = radius * math.sin(phi) * math.sin(theta)
     z = radius * math.cos(phi)
-    cam.location = (x, y, z)
 
-def make_volume_material(density_scale=5.0, color=(0.6, 0.6, 0.6, 1.0)):
+    camera.location = (x, y, z)
+
+
+# ============================================================
+# VOLUME MATERIAL
+# ============================================================
+
+def density_scale_for_sigma(
+    sigma,
+    target_opacity=TARGET_OPACITY,
+    band_sigmas=BAND_SIGMAS,
+):
     """
-    Simple Principled Volume material that uses the VDB's density grid
-    and scales it by density_scale.
+    Convert desired opacity into a density multiplier for the Gaussian VDB.
+
+    Generated density is:
+
+        V(d) = exp(-0.5 * (d / sigma)^2)
+
+    The VDB stores approximately the interval [-3 sigma, +3 sigma].
+    This scaling makes thin and thick shells have approximately equal
+    opacity when seen front-facing.
     """
-    mat = bpy.data.materials.new(name="PreviewVolumeMat")
-    mat.use_nodes = True
-    nodes = mat.node_tree.nodes
-    links = mat.node_tree.links
-    for n in list(nodes):
-        nodes.remove(n)
+    sigma = float(sigma)
+    target_opacity = float(target_opacity)
 
-    out = nodes.new("ShaderNodeOutputMaterial")
-    out.location = (400, 0)
+    if sigma <= 0.0:
+        raise ValueError(f"sigma must be positive, got {sigma}")
 
-    vol = nodes.new("ShaderNodeVolumePrincipled")
-    vol.location = (0, 0)
-    vol.inputs["Color"].default_value  = color
-    vol.inputs["Density"].default_value = 1.0
+    if target_opacity <= 0.0:
+        return 0.0
 
-    # Volume Info node: reads density/color from the Volume object
-    vol_info = nodes.new("ShaderNodeVolumeInfo")
-    vol_info.location = (-300, 0)
+    # Avoid log(0) and infinitely large extinction.
+    target_opacity = min(target_opacity, 1.0 - 1e-6)
 
-    # Multiply density by a global scale
-    mul = nodes.new("ShaderNodeMath")
-    mul.operation = 'MULTIPLY'
-    mul.inputs[1].default_value = density_scale
-    mul.location = (-100, -50)
+    optical_depth = -math.log(1.0 - target_opacity)
 
-    links.new(vol_info.outputs["Density"], mul.inputs[0])
-    links.new(mul.outputs["Value"], vol.inputs["Density"])
-    links.new(vol.outputs["Volume"], out.inputs["Volume"])
+    retained_integral = (
+        math.sqrt(2.0 * math.pi)
+        * sigma
+        * math.erf(float(band_sigmas) / math.sqrt(2.0))
+    )
 
-    return mat
+    return optical_depth / retained_integral
 
-def load_vdb_volume(sample_id, volume_rel_path):
+
+def make_volume_material(
+    density_scale,
+    color=(0.65, 0.65, 0.65, 1.0),
+):
     """
-    Load volume_XXXX.vdb corresponding to volume_XXXX.npy as a Volume object.
+    Create a Principled Volume material.
 
-    volume_rel_path: relative path from metadata (e.g. "volume_0001.npy").
+    Volume Info reads the density grid stored in the imported VDB.
+    A math node multiplies it by density_scale.
     """
-    vol_npy = Path(volume_rel_path)
-    if vol_npy.suffix != ".npy":
-        raise ValueError(f"Expected .npy in volume_path, got: {volume_rel_path}")
-    vol_vdb = vol_npy.with_suffix(".vdb")  # same name, .vdb extension
+    material = bpy.data.materials.new(name="PreviewVolumeMaterial")
+    material.use_nodes = True
 
-    full_vdb = (BASE_DIR / vol_vdb).resolve()
-    if not full_vdb.is_file():
-        raise FileNotFoundError(f"VDB file not found: {full_vdb}")
+    nodes = material.node_tree.nodes
+    links = material.node_tree.links
 
-    # Import VDB as a Volume object; the operator will create an object
-    # and make it the active object.
-    bpy.ops.object.volume_import(filepath=str(full_vdb))
-    vol_obj = bpy.context.object    # newly created volume object
+    for node in list(nodes):
+        nodes.remove(node)
 
-    # Name it nicely
-    vol_obj.name = f"vol_{sample_id:04d}"
+    output_node = nodes.new("ShaderNodeOutputMaterial")
+    output_node.location = (450, 0)
 
-    # Our export used voxelSize=1/nx with origin at (0,0,0),
-    # so the volume spans roughly [0,1]^3. Move it so cube is centered.
-    vol_obj.location = (-0.5, -0.5, -0.5)
+    principled_volume = nodes.new("ShaderNodeVolumePrincipled")
+    principled_volume.location = (120, 0)
+    principled_volume.inputs["Color"].default_value = color
+    principled_volume.inputs["Density"].default_value = 1.0
 
-    return vol_obj
+    volume_info = nodes.new("ShaderNodeVolumeInfo")
+    volume_info.location = (-320, 0)
 
-# ==============================
+    density_multiplier = nodes.new("ShaderNodeMath")
+    density_multiplier.operation = "MULTIPLY"
+    density_multiplier.location = (-100, -50)
+    density_multiplier.inputs[1].default_value = float(density_scale)
+
+    links.new(
+        volume_info.outputs["Density"],
+        density_multiplier.inputs[0],
+    )
+    links.new(
+        density_multiplier.outputs["Value"],
+        principled_volume.inputs["Density"],
+    )
+    links.new(
+        principled_volume.outputs["Volume"],
+        output_node.inputs["Volume"],
+    )
+
+    return material
+
+
+# ============================================================
+# VDB LOADING
+# ============================================================
+
+def load_vdb_volume(sample_id):
+    """
+    Load the VDB corresponding to this CSV sample ID.
+
+    Expected VDB location:
+        BASE_DIR / 'vdb' / 'volume_000001.vdb'
+    """
+    vdb_path = VDB_DIR / f"volume_{sample_id:06d}.vdb"
+
+    if not vdb_path.is_file():
+        raise FileNotFoundError(f"VDB file not found: {vdb_path}")
+
+    bpy.ops.object.volume_import(filepath=str(vdb_path))
+
+    volume_obj = bpy.context.object
+    volume_obj.name = f"volume_{sample_id:06d}"
+
+    return volume_obj
+
+
+# ============================================================
 # MAIN
-# ==============================
+# ============================================================
 
 def main():
     start_id = None
-    end_id   = None
+    end_id = None
 
     argv = sys.argv[sys.argv.index("--") + 1:] if "--" in sys.argv else []
+
     if "--start_id" in argv:
         start_id = int(argv[argv.index("--start_id") + 1])
+
     if "--end_id" in argv:
         end_id = int(argv[argv.index("--end_id") + 1])
+
+    if not VOLUME_METADATA_CSV.is_file():
+        raise FileNotFoundError(
+            f"Metadata CSV not found: {VOLUME_METADATA_CSV}"
+        )
 
     scene = bpy.context.scene
     clean_scene()
 
-    scene.render.engine = 'CYCLES'
-    scene.cycles.device = 'CPU'
+    # Render setup.
+    scene.render.engine = "CYCLES"
+    scene.cycles.device = "CPU"
     scene.cycles.samples = SAMPLES
+
     scene.render.resolution_x = RES_X
     scene.render.resolution_y = RES_Y
-    scene.view_settings.view_transform = 'Filmic'
-    scene.view_settings.look = 'None'
+    scene.render.resolution_percentage = 100
+
+    scene.render.image_settings.file_format = "PNG"
+    scene.render.image_settings.color_mode = "RGBA"
+
+    scene.view_settings.view_transform = "Filmic"
+    scene.view_settings.look = "None"
     scene.view_settings.exposure = 0.0
     scene.view_settings.gamma = 1.0
 
-    # somewhat finer volume sampling for preview
     scene.cycles.volume_step_rate = 1.0
     scene.cycles.volume_max_steps = 1024
 
-    setup_world_and_lighting(scene)
+    # Preview with a visible background rather than alpha.
+    scene.render.film_transparent = False
 
-    # load volume metadata
+    setup_dark_world(scene)
+
+    # Read volume metadata.
     with open(VOLUME_METADATA_CSV, "r", newline="") as f:
-        vol_reader = csv.DictReader(f)
-        vol_rows = [row for row in vol_reader]
+        volume_rows = list(csv.DictReader(f))
 
-    # optional filter by sample_id
     if start_id is not None or end_id is not None:
-        filtered = []
-        for row in vol_rows:
-            sid = int(row["sample_id"])
-            if (start_id is None or sid >= start_id) and (end_id is None or sid <= end_id):
-                filtered.append(row)
-        vol_rows = filtered
-        print(f"Previewing sample_id in [{start_id}, {end_id}], count={len(vol_rows)}")
+        volume_rows = [
+            row
+            for row in volume_rows
+            if (
+                (start_id is None or int(row["sample_id"]) >= start_id)
+                and (end_id is None or int(row["sample_id"]) <= end_id)
+            )
+        ]
 
-    # volume material
-    preview_vol_mat = make_volume_material(density_scale=5.0)
+    volume_rows.sort(key=lambda row: int(row["sample_id"]))
 
-    for vol_row in vol_rows:
-        sample_id  = int(vol_row["sample_id"])
-        volume_rel = vol_row["volume_path"]   # e.g. "volume_0001.npy"
+    print("=" * 70)
+    print("VDB preview rendering")
+    print(f"Metadata rows selected: {len(volume_rows):,}")
+    print(f"Target opacity: {TARGET_OPACITY:.3f}")
+    print(f"VDB directory: {VDB_DIR}")
+    print("=" * 70)
 
-        # remove existing non-light, non-camera objects
-        for o in list(bpy.data.objects):
-            if o.type not in {'LIGHT', 'CAMERA'}:
-                bpy.data.objects.remove(o, do_unlink=True)
+    if not volume_rows:
+        print("No samples selected.")
+        return
 
-        # load VDB volume
+    for index, row in enumerate(volume_rows, start=1):
+        sample_id = int(row["sample_id"])
+        sigma = float(row["sigma"])
+
+        remove_previous_volume_and_camera()
+
         try:
-            vol_obj = load_vdb_volume(sample_id, volume_rel)
-        except FileNotFoundError as e:
-            print("[WARN]", e)
+            volume_obj = load_vdb_volume(sample_id)
+        except FileNotFoundError as exc:
+            print(f"[WARN] {exc}")
             continue
 
-        # assign volume material
-        vol_obj.data.materials.clear()
-        vol_obj.data.materials.append(preview_vol_mat)
+        density_scale = density_scale_for_sigma(
+            sigma=sigma,
+            target_opacity=TARGET_OPACITY,
+        )
 
-        # remove existing cameras, create new one
-        for o in list(bpy.data.objects):
-            if o.type == 'CAMERA':
-                bpy.data.objects.remove(o, do_unlink=True)
-        cam = create_camera(scene, vol_obj)
-        set_camera_from_spherical(cam, RADIUS, PHI, THETA)
+        material = make_volume_material(
+            density_scale=density_scale,
+            color=(0.65, 0.65, 0.65, 1.0),
+        )
 
-        # render a single PNG per shape
-        img_name = f"preview_vdb_s{sample_id:04d}.png"
-        img_path = str(RENDER_DIR / img_name)
-        scene.render.filepath = img_path
+        volume_obj.data.materials.clear()
+        volume_obj.data.materials.append(material)
+
+        camera = create_camera(scene, volume_obj)
+        set_camera_from_spherical(
+            camera,
+            radius=RADIUS,
+            phi=PHI,
+            theta=THETA,
+        )
+
+        image_name = (
+            f"preview_vdb_s{sample_id:06d}_"
+            f"sigma{sigma:.3f}_"
+            f"opacity{TARGET_OPACITY:.2f}.png"
+        )
+
+        image_path = RENDER_DIR / image_name
+
+        scene.render.filepath = str(image_path)
         bpy.ops.render.render(write_still=True)
-        print("Rendered VDB preview:", img_path)
 
-    print("Done. VDB previews written to", RENDER_DIR)
+        # Remove material after rendering, avoiding memory accumulation.
+        volume_obj.data.materials.clear()
+
+        if material.users == 0:
+            bpy.data.materials.remove(material)
+
+        print(
+            f"[{index}/{len(volume_rows)}] rendered "
+            f"sample_id={sample_id}, "
+            f"sigma={sigma:.4f}, "
+            f"density_scale={density_scale:.4f}: "
+            f"{image_path}"
+        )
+
+    print("Done. Preview images written to", RENDER_DIR)
 
 
 if __name__ == "__main__":

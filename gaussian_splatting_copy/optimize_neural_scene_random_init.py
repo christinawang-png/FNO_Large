@@ -2497,6 +2497,19 @@ def is_slice_potentially_visible(
         and y <= H + margin_px
     )
 
+def enable_lighting_optimization(neural_scene):
+    """
+    Enable global and local SH residuals after warmup/resume.
+    """
+    neural_scene.lighting.raw_global_sh_delta.requires_grad_(True)
+
+    for i, neural_slice in enumerate(neural_scene.slices):
+        neural_slice.optimize_environment = True
+        neural_slice.raw_local_sh_delta.requires_grad_(True)
+
+    print(
+        "[LIGHTING] Enabled global SH and local slice SH residuals."
+    )
 
 # ============================================================
 # MAIN
@@ -3099,9 +3112,7 @@ def main():
             and current_stage == "lighting"
         )
 
-        neural_scene.lighting.raw_global_sh_delta.requires_grad_(
-            enable_global_sh
-        )
+        enable_lighting_optimization(neural_scene)
 
     optimizer = make_optimizer(
         neural_scene=neural_scene,
@@ -3110,17 +3121,32 @@ def main():
     )
 
     # Restore optimizer state only after topology is rebuilt.
-    if args.resume_checkpoint is not None:
+    checkpoint_sh_enabled = bool(
+        checkpoint.get("metadata", {}).get(
+            "optimize_sh",
+            False,
+        )
+    )
+
+    if (
+        args.resume_checkpoint is not None
+        and checkpoint_sh_enabled
+        and current_stage == "lighting"
+    ):
         try:
             optimizer.load_state_dict(
                 checkpoint["optimizer_state"]
             )
-            print("Restored optimizer state.")
+            print("Restored lighting-stage optimizer state.")
         except Exception as exc:
             print(
                 "[WARN] Could not restore optimizer state:",
                 exc,
             )
+    else:
+        print(
+            "[OPTIMIZER] Using fresh optimizer after resume/stage change."
+        )
 
     print(
         f"[SCHEDULE] Starting stage: {current_stage}"
@@ -3204,23 +3230,19 @@ def main():
 
             if (
                 args.optimize_sh
+                and iteration == args.global_sh_warmup_iterations
                 and current_stage == "lighting"
             ):
-                neural_scene.lighting.raw_global_sh_delta.requires_grad_(
-                    iteration
-                    >= args.global_sh_warmup_iterations
+                enable_lighting_optimization(neural_scene)
+            
+                # Rebuild so global/local SH get their lighting-stage LR.
+                optimizer = make_optimizer(
+                    neural_scene=neural_scene,
+                    stage="lighting",
+                    optimize_sh=True,
                 )
-
-            optimizer = make_optimizer(
-                neural_scene=neural_scene,
-                stage=current_stage,
-                optimize_sh=args.optimize_sh,
-            )
-
-            print(
-                f"[SCHEDULE] Iteration {iteration}: "
-                f"stage={current_stage}"
-            )
+            
+                print("[LIGHTING] Rebuilt optimizer for lighting stage.")
 
         if (
             args.optimize_sh

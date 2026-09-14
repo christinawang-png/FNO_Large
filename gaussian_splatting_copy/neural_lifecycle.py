@@ -616,6 +616,7 @@ def split_top_slices(
 @torch.no_grad()
 def voxel_chunk_seeds(
     xyz,
+    color=None,
     voxel_size=0.5,
     min_points=30,
     max_chunks=64,
@@ -680,6 +681,19 @@ def voxel_chunk_seeds(
             0,
             point_indices,
         )
+        
+        if colors is not None:
+            voxel_colors = colors.index_select(
+                0,
+                point_indices,
+            )
+        
+            # Robust color prior. Median is less sensitive to outliers.
+            color = voxel_colors.median(
+                dim=0,
+            ).values.clamp(0.02, 1.0)
+        else:
+            color = None
 
         center = points.median(
             dim=0,
@@ -690,6 +704,7 @@ def voxel_chunk_seeds(
                 "center": center,
                 "world_size": float(voxel_size),
                 "num_points": count,
+                "color": color,
             }
         )
 
