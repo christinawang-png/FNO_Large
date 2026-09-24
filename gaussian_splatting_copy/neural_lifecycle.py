@@ -146,7 +146,15 @@ def collect_batched_lifecycle_stats(
         )
 
         clip = points_h @ camera.full_proj_transform
-        ndc = clip[:, :3] / clip[:, 3:4].clamp_min(1e-8)
+        clip_w = clip[:, 3]
+
+        valid_w = clip_w > 1e-8
+        
+        ndc = torch.zeros_like(clip[:, :3])
+        ndc[valid_w] = (
+            clip[valid_w, :3]
+            / clip_w[valid_w, None]
+        )
 
         image_w = float(camera.image_width)
         image_h = float(camera.image_height)
@@ -178,7 +186,8 @@ def collect_batched_lifecycle_stats(
         )
 
         visible = (
-            (ndc[:, 2] > 0.0)
+            valid_w
+            & (ndc[:, 2] > 0.0)
             & torch.isfinite(patch_size)
             & (patch_size >= float(min_patch_size_px))
             & (pixel_x >= -float(margin_px))
@@ -614,31 +623,67 @@ def split_top_slices(
 # ============================================================
 
 @torch.no_grad()
+@torch.no_grad()
 def voxel_chunk_seeds(
     xyz,
-    color=None,
+    colors=None,
     voxel_size=0.5,
     min_points=30,
     max_chunks=64,
 ):
     """
-    Create initial chunk seeds from a point cloud.
+    Create initial slice/chunk seeds from a point cloud using a voxel grid.
 
-    Returns a list of dictionaries:
+    Parameters
+    ----------
+    xyz : torch.Tensor, shape [N, 3]
+        Point-cloud positions.
+
+    colors : torch.Tensor or None, shape [N, 3]
+        Optional RGB values corresponding to xyz points. Values are expected
+        in [0, 1]. Each returned seed receives the component-wise median RGB
+        color of points in its voxel.
+
+    voxel_size : float
+        Side length of each initialization voxel in world units.
+
+    min_points : int
+        Skip voxels containing fewer than this many points.
+
+    max_chunks : int or None
+        Retain at most this many densest voxel chunks. Use None or <= 0
+        to retain all valid chunks.
+
+    Returns
+    -------
+    list[dict]
+        Each dict contains:
 
         {
-            "center": [3] tensor,
+            "center":     tensor [3],
             "world_size": float,
             "num_points": int,
+            "color":      tensor [3] or None,
         }
-
-    This is a simple voxel-grid initialization. It is not yet
-    orientation-aware.
     """
     if xyz.ndim != 2 or xyz.shape[1] != 3:
         raise ValueError(
-            f"Expected xyz [N,3], got {tuple(xyz.shape)}"
+            f"Expected xyz with shape [N, 3], got {tuple(xyz.shape)}"
         )
+
+    if colors is not None:
+        if colors.ndim != 2 or colors.shape[1] != 3:
+            raise ValueError(
+                f"Expected colors with shape [N, 3], got {tuple(colors.shape)}"
+            )
+
+        if colors.shape[0] != xyz.shape[0]:
+            raise ValueError(
+                f"xyz has {xyz.shape[0]} points but colors has "
+                f"{colors.shape[0]} points."
+            )
+
+        colors = colors.to(device=xyz.device, dtype=xyz.dtype)
 
     voxel_index = torch.floor(
         xyz / float(voxel_size)
@@ -651,73 +696,66 @@ def voxel_chunk_seeds(
         return_counts=True,
     )
 
-    candidates = []
-
-    # Make sure inverse is a simple [N] vector.
     inverse = inverse.reshape(-1)
     counts = counts.reshape(-1)
 
-    for voxel_id in range(unique_voxels.shape[0]):
-        count = int(counts[voxel_id].item())
+    candidates = []
 
-        if count < min_points:
+    for voxel_id in range(unique_voxels.shape[0]):
+        num_points = int(counts[voxel_id].item())
+
+        if num_points < int(min_points):
             continue
 
-        # Explicit indices are safer than direct boolean indexing.
         point_indices = torch.nonzero(
             inverse == voxel_id,
             as_tuple=True,
         )[0]
 
-        # Defensive guard: should agree with `count`, but avoid crash.
         if point_indices.numel() == 0:
             print(
-                f"[WARN] voxel_id={voxel_id} has count={count} "
-                "but no selected points; skipping."
+                f"[WARN] voxel_id={voxel_id} has count={num_points}, "
+                "but selected no point indices. Skipping."
             )
             continue
 
-        points = xyz.index_select(
-            0,
-            point_indices,
-        )
-        
+        voxel_points = xyz.index_select(0, point_indices)
+
+        # Robust center: component-wise coordinate median.
+        center = voxel_points.median(dim=0).values
+
+        # Robust color prior: component-wise RGB median.
+        #
+        # This is appropriate if your point colors are already normalized
+        # to [0, 1]. The clamp avoids exact 0 or 1 initialization values.
         if colors is not None:
-            voxel_colors = colors.index_select(
-                0,
-                point_indices,
-            )
-        
-            # Robust color prior. Median is less sensitive to outliers.
-            color = voxel_colors.median(
-                dim=0,
+            voxel_colors = colors.index_select(0, point_indices)
+
+            seed_color = voxel_colors.median(
+                dim=0
             ).values.clamp(0.02, 1.0)
         else:
-            color = None
-
-        center = points.median(
-            dim=0,
-        ).values
+            seed_color = None
 
         candidates.append(
             {
                 "center": center,
                 "world_size": float(voxel_size),
-                "num_points": count,
-                "color": color,
+                "num_points": num_points,
+                "color": seed_color,
             }
         )
 
-    # Favor dense chunks initially.
+    # Dense voxels are used first as initialization chunks.
     candidates.sort(
-        key=lambda x: x["num_points"],
+        key=lambda seed: seed["num_points"],
         reverse=True,
     )
-    
+
     if max_chunks is None or max_chunks <= 0:
         return candidates
 
-    return candidates[:max_chunks]
+    return candidates[:int(max_chunks)]
 
 
 # ============================================================
