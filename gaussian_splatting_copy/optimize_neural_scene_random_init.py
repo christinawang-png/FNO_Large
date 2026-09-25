@@ -37,6 +37,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
+from pytorch_msssim import ssim
+
 # ============================================================
 # PATH SETUP
 # ============================================================
@@ -129,11 +131,11 @@ LOCAL_SH_REG_WEIGHT = 1e-2
 GLOBAL_SH_REG_WEIGHT = 1e-2
 NEIGHBOR_SH_REG_WEIGHT = 1e-1
 
-GLOBAL_SH_BOUND = 0.005
+GLOBAL_SH_BOUND = 0.05
 MAX_GRAD_NORM = 1.0
 
 # Optimization schedule.
-SHAPE_WARMUP_ITERS = 100
+SHAPE_WARMUP_ITERS = 50
 LIGHTING_START_ITERS = 300
 
 EARLY_PLACEMENT_LR = 1e-3
@@ -148,8 +150,8 @@ LATE_PLACEMENT_LR = 1e-4
 LATE_SHAPE_LR = 5e-4
 LATE_MATERIAL_LR = 2e-3
 
-LOCAL_SH_LR = 1e-4
-GLOBAL_SH_LR = 1e-3
+LOCAL_SH_LR = 1e-3
+GLOBAL_SH_LR = 1e-2
 
 
 # ============================================================
@@ -1007,18 +1009,44 @@ def visible_rgb_from_rgba(rgba):
     ) * background
 
 
-def image_loss(predicted_rgba, target_rgb):
+def image_loss(
+    predicted_rgba,
+    target_rgb,
+    l1_weight=0.4,
+    mse_weight=0.4,
+    ssim_weight=0.2,
+):
     """
-    Current inverse-render objective.
+    Mixed RGB reconstruction loss.
 
-    Target images from 3DGS Scene are ordinary RGB, so predicted
-    premultiplied RGBA is composited onto the configured white background.
+    The neural renderer produces premultiplied RGBA. First composite it
+    over BACKGROUND_RGB, then compare against the ordinary 3DGS RGB target.
+
+    SSIM is converted to a loss as:
+        1 - SSIM
     """
     predicted_rgb = visible_rgb_from_rgba(predicted_rgba)
 
+    l1 = F.l1_loss(predicted_rgb, target_rgb)
+    mse = F.mse_loss(predicted_rgb, target_rgb)
+
+    # data_range=1 because both images are expected in [0, 1].
+    #
+    # For small images, the default 11x11 SSIM window is still generally
+    # acceptable at 32x32 or larger.
+    ssim_value = ssim(
+        predicted_rgb.clamp(0.0, 1.0),
+        target_rgb.clamp(0.0, 1.0),
+        data_range=1.0,
+        size_average=True,
+    )
+
+    ssim_loss = 1.0 - ssim_value
+
     return (
-        0.5 * F.l1_loss(predicted_rgb, target_rgb)
-        + 0.5 * F.mse_loss(predicted_rgb, target_rgb)
+        l1_weight * l1
+        + mse_weight * mse
+        + ssim_weight * ssim_loss
     )
 
 
@@ -1599,6 +1627,177 @@ def save_checkpoint_previews(
     
 
 # ============================================================
+# SPLIT-TIME SURFACE / VOLUME MODE SELECTION
+# ============================================================
+
+@torch.no_grad()
+def set_slice_mode(neural_slice, mode):
+    """
+    Return a copied slice configured as either surface or volume.
+
+    The child keeps its learned/inherited control grid, sigma, color,
+    opacity, roughness, local SH, center, and world size. Only the
+    FNO interpretation changes.
+
+    For volume mode, fno_values() automatically supplies:
+        metallic = 0
+        roughness = 0
+        specular = 0
+    matching volume-model training.
+    """
+    if mode not in {"surface", "volume"}:
+        raise ValueError(f"Invalid mode: {mode}")
+
+    candidate = copy.deepcopy(neural_slice)
+    candidate.mode = mode
+
+    # These values are ignored/zeroed by fno_values() for volume mode,
+    # but setting them to zero makes inspection/checkpoints clearer.
+    if mode == "volume":
+        candidate.metallic_value.fill_(0.0)
+        candidate.specular_value.fill_(0.0)
+
+    return candidate
+
+
+@torch.no_grad()
+def score_child_pair_modes(
+    renderer,
+    neural_scene,
+    parent_index,
+    child_a,
+    child_b,
+    mode_a,
+    mode_b,
+    cameras,
+):
+    """
+    Test one surface/volume assignment for two children.
+
+    It temporarily replaces the parent in the rendered slice list:
+
+        existing scene:
+            [... parent ...]
+
+        temporary test scene:
+            [... child_a, child_b ...]
+
+    Returns:
+        mean_loss, configured_child_a, configured_child_b
+    """
+    candidate_a = set_slice_mode(child_a, mode_a)
+    candidate_b = set_slice_mode(child_b, mode_b)
+
+    temporary_slices = (
+        list(neural_scene.slices[:parent_index])
+        + [candidate_a, candidate_b]
+        + list(neural_scene.slices[parent_index + 1:])
+    )
+
+    total_loss = 0.0
+    valid_views = 0
+
+    for camera in cameras:
+        prediction_rgba, _ = renderer.render_slice_list_batched(
+            camera=camera,
+            slices=temporary_slices,
+            shared_sh=neural_scene.global_sh,
+            collect_diagnostics=False,
+        )
+
+        target_rgb = camera.original_image.detach()
+
+        if target_rgb.ndim == 3:
+            target_rgb = target_rgb.unsqueeze(0)
+
+        target_rgb = target_rgb.to(
+            device=prediction_rgba.device,
+            dtype=prediction_rgba.dtype,
+        )
+
+        loss = image_loss(
+            prediction_rgba,
+            target_rgb,
+        )
+
+        if torch.isfinite(loss):
+            total_loss += float(loss.item())
+            valid_views += 1
+
+    if valid_views == 0:
+        return float("inf"), candidate_a, candidate_b
+
+    return (
+        total_loss / valid_views,
+        candidate_a,
+        candidate_b,
+    )
+
+
+@torch.no_grad()
+def choose_split_child_modes(
+    renderer,
+    neural_scene,
+    parent_index,
+    child_a,
+    child_b,
+    cameras,
+):
+    """
+    Evaluate all surface/volume combinations for a newly split parent.
+
+    Returns:
+        chosen_child_a, chosen_child_b
+    """
+    mode_combinations = [
+        ("surface", "surface"),
+        ("surface", "volume"),
+        ("volume", "surface"),
+        ("volume", "volume"),
+    ]
+
+    best_loss = float("inf")
+    best_children = None
+    best_modes = None
+
+    for mode_a, mode_b in mode_combinations:
+        loss, candidate_a, candidate_b = score_child_pair_modes(
+            renderer=renderer,
+            neural_scene=neural_scene,
+            parent_index=parent_index,
+            child_a=child_a,
+            child_b=child_b,
+            mode_a=mode_a,
+            mode_b=mode_b,
+            cameras=cameras,
+        )
+
+        print(
+            f"[MODE SELECT] parent={parent_index} "
+            f"candidate=({mode_a}, {mode_b}) "
+            f"loss={loss:.8f}"
+        )
+
+        if loss < best_loss:
+            best_loss = loss
+            best_modes = (mode_a, mode_b)
+            best_children = (candidate_a, candidate_b)
+
+    if best_children is None:
+        raise RuntimeError(
+            f"Could not choose modes for children of parent {parent_index}."
+        )
+
+    print(
+        f"[MODE SELECT] parent={parent_index} "
+        f"selected={best_modes} "
+        f"loss={best_loss:.8f}"
+    )
+
+    return best_children
+    
+
+# ============================================================
 # CONTRIBUTION-BASED PRUNING
 # ============================================================
 
@@ -1910,6 +2109,25 @@ def main():
             "Use 0.0 to prune only slices whose removal improves loss. "
             "Use a small positive value such as 1e-4 to also prune nearly "
             "redundant slices."
+        ),
+    )
+    
+    parser.add_argument(
+        "--disable_child_mode_selection",
+        action="store_true",
+        help=(
+            "Disable loss-based surface/volume selection after splitting. "
+            "When disabled, children inherit the parent mode."
+        ),
+    )
+    
+    parser.add_argument(
+        "--child_selection_cameras",
+        type=int,
+        default=1,
+        help=(
+            "Number of cameras used to compare surface/volume child-mode "
+            "combinations after a split."
         ),
     )
 
@@ -2273,6 +2491,36 @@ def main():
         )
 
         valid_camera_count = 0
+        
+        child_selection_cameras = step_cameras[
+            :min(
+                int(args.child_selection_cameras),
+                len(step_cameras),
+            )
+        ]
+        
+        if not child_selection_cameras:
+            raise RuntimeError(
+                "No cameras available for split-time mode selection."
+            )
+        
+        
+        def split_mode_selector(parent_index, child_a, child_b):
+            """
+            Called by split_top_slices() for every accepted parent split.
+            """
+            if args.disable_child_mode_selection:
+                # No mode change: preserve inherited parent mode.
+                return child_a, child_b
+        
+            return choose_split_child_modes(
+                renderer=renderer,
+                neural_scene=neural_scene,
+                parent_index=parent_index,
+                child_a=child_a,
+                child_b=child_b,
+                cameras=child_selection_cameras,
+            )
 
         for camera in step_cameras:
             predicted_rgba, _ = renderer(camera, neural_scene)
@@ -2330,6 +2578,31 @@ def main():
             )
 
         loss_regularization.backward()
+        
+        if (
+            args.optimize_sh
+            and current_stage == "lighting"
+            and iteration % 1 == 0
+        ):
+            global_grad = neural_scene.lighting.raw_global_sh_delta.grad
+        
+            print(
+                f"[LIGHT DEBUG] iter={iteration} "
+                f"global_requires_grad="
+                f"{neural_scene.lighting.raw_global_sh_delta.requires_grad} "
+                f"global_grad_norm="
+                f"{global_grad.norm().item() if global_grad is not None else None}"
+            )
+        
+            for i, block in enumerate(neural_scene.slices[:5]):
+                local_grad = block.raw_local_sh_delta.grad
+        
+                print(
+                    f"  slice={i:03d} "
+                    f"local_requires_grad={block.raw_local_sh_delta.requires_grad} "
+                    f"local_grad_norm="
+                    f"{local_grad.norm().item() if local_grad is not None else None}"
+                )
 
         accumulate_gradient_stats(
             neural_scene,
@@ -2360,6 +2633,26 @@ def main():
         )
 
         optimizer.step()
+        
+        if (
+            args.optimize_sh
+            and current_stage == "lighting"
+            and iteration % 1 == 0
+        ):
+            effective_global_delta = (
+                neural_scene.global_sh
+                - neural_scene.lighting.initial_global_sh
+            )
+        
+            print(
+                f"[LIGHT STATE] iter={iteration} "
+                f"raw_global_norm="
+                f"{neural_scene.lighting.raw_global_sh_delta.detach().norm().item():.6e} "
+                f"effective_global_norm="
+                f"{effective_global_delta.detach().norm().item():.6e} "
+                f"effective_global_max_abs="
+                f"{effective_global_delta.detach().abs().max().item():.6e}"
+            )
 
         # ----------------------------------------------------
         # Optional topology updates.
@@ -2465,7 +2758,7 @@ def main():
                     gradient_stats=gradient_summary,
                     max_splits=args.max_splits_per_update,
                     max_total_slices=max_total_slices,
-                    mode_selector=None,
+                    mode_selector=split_mode_selector,
                 )
 
                 if split_indices:

@@ -159,7 +159,7 @@ class LearnableNeuralSlice(nn.Module):
         metallic=0.0,
         specular=0.5,
         optimize_environment=True,
-        local_sh_bound=0.005,
+        local_sh_bound=0.01,
     ):
         super().__init__()
 

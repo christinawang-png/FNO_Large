@@ -292,10 +292,12 @@ def choose_batched_split_candidates(
     gradient_summary,
     max_candidates=8,
     min_visible_views=1,
-    min_projected_area=64.0,
+    min_projected_area=0.0,
 ):
     """
-    Return high-value split candidates.
+    Rank slices for splitting primarily by center-position gradient.
+
+    Small slices are allowed to split when min_projected_area <= 0.
     """
     scored = []
 
@@ -303,18 +305,18 @@ def choose_batched_split_candidates(
         if stats["visible_views"] < min_visible_views:
             continue
 
-        if stats["mean_projected_area"] < min_projected_area:
+        # Optional guard only. Set min_projected_area=0 to allow
+        # small projected slices to be considered.
+        if (
+            min_projected_area > 0.0
+            and stats["mean_projected_area"] < min_projected_area
+        ):
             continue
 
-        grad_score = (
-            gradient_summary["center_grad_norm"][i]
-            + gradient_summary["size_grad_norm"][i]
-        )
-
+        # No size-gradient term and no projected-area boost.
         score = (
-            grad_score
+            gradient_summary["center_grad_norm"][i]
             * stats["opacity"]
-            * stats["mean_projected_area"]
         )
 
         scored.append((score, i))
