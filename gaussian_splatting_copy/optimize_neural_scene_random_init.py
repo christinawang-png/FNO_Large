@@ -68,6 +68,7 @@ from neural_lifecycle import (
     accumulate_gradient_stats,
     choose_batched_prune_candidates,
     choose_batched_split_candidates,
+    choose_low_opacity_prune_candidates,
     collect_batched_lifecycle_stats,
     finalize_gradient_stats,
     make_gradient_stats,
@@ -136,22 +137,30 @@ MAX_GRAD_NORM = 1.0
 
 # Optimization schedule.
 SHAPE_WARMUP_ITERS = 50
-LIGHTING_START_ITERS = 300
+LIGHTING_START_ITERS = 100
 
-EARLY_PLACEMENT_LR = 1e-3
+EARLY_PLACEMENT_LR = 2e-2
 EARLY_SHAPE_LR = 5e-2
 EARLY_MATERIAL_LR = 7e-2
 
-MID_PLACEMENT_LR = 5e-4
-MID_SHAPE_LR = 1e-3
-MID_MATERIAL_LR = 2e-3
+MID_PLACEMENT_LR = 5e-3
+MID_SHAPE_LR = 2e-2
+MID_MATERIAL_LR = 2e-2
 
-LATE_PLACEMENT_LR = 1e-4
-LATE_SHAPE_LR = 5e-4
-LATE_MATERIAL_LR = 2e-3
+LATE_PLACEMENT_LR = 1e-3
+LATE_SHAPE_LR = 5e-3
+LATE_MATERIAL_LR = 1e-2
 
 LOCAL_SH_LR = 1e-3
 GLOBAL_SH_LR = 1e-2
+
+# Soft surface/volume gate optimization.
+MODE_LR = 5e-2
+
+# Keep zero for the first experiment.
+# Later, a small positive value such as 1e-4 encourages gates to approach
+# pure surface or pure volume decisions.
+MODE_ENTROPY_WEIGHT = 0.0
 
 
 # ============================================================
@@ -737,6 +746,20 @@ class NeuralSceneRenderer(nn.Module):
         shared_sh,
         collect_diagnostics=False,
     ):
+        """
+        Soft-mode renderer.
+
+        Every active slice is evaluated by BOTH frozen FNO models:
+
+            surface_patch = surface_fno(surface_features)
+            volume_patch  = volume_fno(volume_features)
+
+        Then the local premultiplied RGBA patch is blended:
+
+            patch =
+                surface_weight * surface_patch
+                + volume_weight * volume_patch
+        """
         if self.use_visibility_culling:
             active_indices = select_visible_slice_indices_batched(
                 camera=camera,
@@ -774,6 +797,10 @@ class NeuralSceneRenderer(nn.Module):
 
             return empty, []
 
+        # ----------------------------------------------------
+        # Build both checkpoint-conditioning vectors per slice.
+        # ----------------------------------------------------
+
         records = []
 
         for local_index, neural_slice in enumerate(active_slices):
@@ -784,21 +811,23 @@ class NeuralSceneRenderer(nn.Module):
                 neural_slice.center,
             )
 
-            if neural_slice.mode == "surface":
-                param_mean = self.surface_mean
-                param_std = self.surface_std
-            elif neural_slice.mode == "volume":
-                param_mean = self.volume_mean
-                param_std = self.volume_std
-            else:
-                raise RuntimeError(
-                    f"Unexpected slice mode: {neural_slice.mode}"
-                )
-
-            param_vector = build_tensor_fno_vector(
+            # Important: every slice gets BOTH modes.
+            surface_param_vector = build_tensor_fno_vector(
                 neural_slice=neural_slice,
-                param_mean=param_mean,
-                param_std=param_std,
+                mode="surface",
+                param_mean=self.surface_mean,
+                param_std=self.surface_std,
+                phi=phi,
+                theta=theta,
+                device=device,
+                shared_sh=shared_sh,
+            )
+
+            volume_param_vector = build_tensor_fno_vector(
+                neural_slice=neural_slice,
+                mode="volume",
+                param_mean=self.volume_mean,
+                param_std=self.volume_std,
                 phi=phi,
                 theta=theta,
                 device=device,
@@ -821,8 +850,15 @@ class NeuralSceneRenderer(nn.Module):
             records.append(
                 {
                     "slice_index": slice_index,
-                    "mode": neural_slice.mode,
-                    "param_vector": param_vector,
+
+                    # New soft-mode conditioning inputs.
+                    "surface_param_vector": surface_param_vector,
+                    "volume_param_vector": volume_param_vector,
+
+                    # Learnable sigmoid-gate weights.
+                    "surface_weight": neural_slice.surface_weight,
+                    "volume_weight": neural_slice.volume_weight,
+
                     "center_x": center_x,
                     "center_y": center_y,
                     "patch_size": projected_patch_size,
@@ -836,88 +872,77 @@ class NeuralSceneRenderer(nn.Module):
                 }
             )
 
-        surface_record_indices = [
-            index
-            for index, record in enumerate(records)
-            if record["mode"] == "surface"
-        ]
+        # ----------------------------------------------------
+        # Run BOTH FNOs for EVERY active slice.
+        # ----------------------------------------------------
 
-        volume_record_indices = [
-            index
-            for index, record in enumerate(records)
-            if record["mode"] == "volume"
-        ]
+        surface_params = torch.cat(
+            [
+                record["surface_param_vector"]
+                for record in records
+            ],
+            dim=0,
+        )
 
-        patches_by_record = [None] * len(records)
+        volume_params = torch.cat(
+            [
+                record["volume_param_vector"]
+                for record in records
+            ],
+            dim=0,
+        )
 
-        if surface_record_indices:
-            surface_params = torch.cat(
-                [
-                    records[index]["param_vector"]
-                    for index in surface_record_indices
-                ],
-                dim=0,
+        surface_patches = run_fno_in_chunks(
+            model=self.surface_model,
+            params=surface_params,
+            batch_size=self.fno_batch_size,
+            use_activation_checkpointing=(
+                self.use_fno_activation_checkpointing
+            ),
+        )
+
+        volume_patches = run_fno_in_chunks(
+            model=self.volume_model,
+            params=volume_params,
+            batch_size=self.fno_batch_size,
+            use_activation_checkpointing=(
+                self.use_fno_activation_checkpointing
+            ),
+        )
+
+        if self.flip_fno_vertical:
+            surface_patches = torch.flip(
+                surface_patches,
+                dims=[2],
             )
 
-            surface_patches = run_fno_in_chunks(
-                model=self.surface_model,
-                params=surface_params,
-                batch_size=self.fno_batch_size,
-                use_activation_checkpointing=(
-                    self.use_fno_activation_checkpointing
-                ),
+            volume_patches = torch.flip(
+                volume_patches,
+                dims=[2],
             )
 
-            if self.flip_fno_vertical:
-                surface_patches = torch.flip(
-                    surface_patches,
-                    dims=[2],
-                )
+        surface_weights = torch.stack(
+            [
+                record["surface_weight"]
+                for record in records
+            ],
+            dim=0,
+        ).view(-1, 1, 1, 1)
 
-            for local_index, record_index in enumerate(
-                surface_record_indices
-            ):
-                patches_by_record[record_index] = (
-                    surface_patches[local_index:local_index + 1]
-                )
+        volume_weights = torch.stack(
+            [
+                record["volume_weight"]
+                for record in records
+            ],
+            dim=0,
+        ).view(-1, 1, 1, 1)
 
-        if volume_record_indices:
-            volume_params = torch.cat(
-                [
-                    records[index]["param_vector"]
-                    for index in volume_record_indices
-                ],
-                dim=0,
-            )
-
-            volume_patches = run_fno_in_chunks(
-                model=self.volume_model,
-                params=volume_params,
-                batch_size=self.fno_batch_size,
-                use_activation_checkpointing=(
-                    self.use_fno_activation_checkpointing
-                ),
-            )
-
-            if self.flip_fno_vertical:
-                volume_patches = torch.flip(
-                    volume_patches,
-                    dims=[2],
-                )
-
-            for local_index, record_index in enumerate(
-                volume_record_indices
-            ):
-                patches_by_record[record_index] = (
-                    volume_patches[local_index:local_index + 1]
-                )
-
-        if any(patch is None for patch in patches_by_record):
-            raise RuntimeError(
-                "At least one active slice failed to receive an FNO patch."
-            )
-
-        all_patches = torch.cat(patches_by_record, dim=0)
+        # Surface and volume outputs are both premultiplied RGBA.
+        # Blending them locally before global depth compositing is correct.
+        all_patches = (
+            surface_weights * surface_patches
+            + volume_weights * volume_patches
+        )
 
         center_x = torch.stack(
             [record["center_x"] for record in records],
@@ -939,8 +964,7 @@ class NeuralSceneRenderer(nn.Module):
             dim=0,
         )
 
-        # Larger camera distance means farther away.
-        # Sorting is detached/discrete, as in Gaussian splatting.
+        # Larger radius means farther from camera.
         sort_indices = torch.argsort(
             depths.detach(),
             descending=True,
@@ -977,10 +1001,24 @@ class NeuralSceneRenderer(nn.Module):
         diagnostics = []
 
         if collect_diagnostics:
-            sorted_record_indices = sort_indices.detach().cpu().tolist()
+            for record_index in sort_indices.detach().cpu().tolist():
+                record = records[record_index]
 
-            for record_index in sorted_record_indices:
-                diagnostics.append(records[record_index])
+                diagnostics.append(
+                    {
+                        "slice_index": record["slice_index"],
+                        "surface_weight": record["surface_weight"],
+                        "volume_weight": record["volume_weight"],
+                        "phi": record["phi"],
+                        "theta": record["theta"],
+                        "radius": record["radius"],
+                        "relative": record["relative"],
+                        "center_x": record["center_x"],
+                        "center_y": record["center_y"],
+                        "center_depth": record["center_depth"],
+                        "patch_size": record["patch_size"],
+                    }
+                )
 
         return composite.clamp(0.0, 1.0), diagnostics
 
@@ -1062,7 +1100,8 @@ def parameter_regularization(neural_scene):
 
     for neural_slice in neural_scene.slices:
         values = neural_slice.fno_values(
-            shared_sh=neural_scene.global_sh
+            mode="surface",
+            shared_sh=neural_scene.global_sh,
         )
 
         position_loss = F.mse_loss(
@@ -1105,15 +1144,28 @@ def parameter_regularization(neural_scene):
             - neural_slice.initial_opacity
         ).square()
 
-        if neural_slice.mode == "surface":
-            appearance_loss = appearance_loss + (
-                values["roughness"]
-                - neural_slice.initial_roughness
-            ).square()
+        appearance_loss = appearance_loss + (
+            values["roughness"]
+            - neural_slice.initial_roughness
+        ).square()
 
         local_sh_loss = torch.mean(
             neural_slice.local_sh_delta.square()
         )
+        
+        if MODE_ENTROPY_WEIGHT > 0.0:
+            p_volume = neural_slice.volume_weight.clamp(
+                1e-6,
+                1.0 - 1e-6,
+            )
+
+            mode_entropy = -(
+                p_volume * torch.log(p_volume)
+                + (1.0 - p_volume)
+                * torch.log(1.0 - p_volume)
+            )
+
+            total = total + MODE_ENTROPY_WEIGHT * mode_entropy
 
         total = total + (
             POSITION_REG_WEIGHT * position_loss
@@ -1219,6 +1271,7 @@ def make_optimizer(neural_scene, stage, optimize_sh):
     placement_params = []
     shape_params = []
     material_params = []
+    mode_params = []
     local_sh_params = []
 
     for neural_slice in neural_scene.slices:
@@ -1244,6 +1297,10 @@ def make_optimizer(neural_scene, stage, optimize_sh):
                 neural_slice.raw_opacity,
                 neural_slice.raw_roughness,
             ]
+        )
+        
+        mode_params.append(
+            neural_slice.raw_mode_logit
         )
 
         if (
@@ -1282,6 +1339,7 @@ def make_optimizer(neural_scene, stage, optimize_sh):
         {"params": placement_params, "lr": placement_lr},
         {"params": shape_params, "lr": shape_lr},
         {"params": material_params, "lr": material_lr},
+        {"params": mode_params, "lr": MODE_LR},
     ]
 
     if optimize_sh and local_sh_params and local_sh_lr > 0.0:
@@ -1523,7 +1581,28 @@ def rebuild_neural_scene_from_checkpoint(
         optimize_sh=optimize_sh,
     ).to(device)
 
-    neural_scene.load_state_dict(checkpoint_data["scene_state"])
+    missing_keys, unexpected_keys = neural_scene.load_state_dict(
+        checkpoint_data["scene_state"],
+        strict=False,
+    )
+
+    print("[SOFT MODE RESUME] Missing state keys:")
+
+    for key in missing_keys:
+        print("  ", key)
+
+    print("[SOFT MODE RESUME] Unexpected state keys:")
+
+    for key in unexpected_keys:
+        print("  ", key)
+
+    # Old hard-mode checkpoints should have missing keys such as:
+    #
+    #   slices.0.raw_mode_logit
+    #   slices.1.raw_mode_logit
+    #
+    # This is expected. Each new mode gate is initialized from the old
+    # hard `mode` field in LearnableNeuralSlice.__init__().
 
     return neural_scene
 
@@ -2091,24 +2170,12 @@ def main():
     )
     
     parser.add_argument(
-        "--prune_selection_cameras",
-        type=int,
-        default=3,
-        help=(
-            "Number of cameras used for expensive contribution-based "
-            "slice-removal tests."
-        ),
-    )
-    
-    parser.add_argument(
-        "--contribution_threshold",
+        "--opacity_prune_threshold",
         type=float,
-        default=0.0,
+        default=0.02,
         help=(
-            "Prune when loss_without_slice - full_loss is <= this value. "
-            "Use 0.0 to prune only slices whose removal improves loss. "
-            "Use a small positive value such as 1e-4 to also prune nearly "
-            "redundant slices."
+            "Hard-prune a slice when its current FNO opacity is at or below "
+            "this threshold."
         ),
     )
     
@@ -2390,22 +2457,15 @@ def main():
         optimize_sh=args.optimize_sh,
     )
 
-    # Optimizer state is only restored when topology and stage match.
-    if (
-        checkpoint_data is not None
-        and checkpoint_data.get("optimizer_state") is not None
-    ):
-        try:
-            optimizer.load_state_dict(
-                checkpoint_data["optimizer_state"]
-            )
-            print("Restored optimizer state.")
-        except Exception as exc:
-            print(
-                "[WARN] Could not restore optimizer state; "
-                "using a fresh optimizer.",
-                exc,
-            )
+    # Soft-mode continuation intentionally starts with a fresh optimizer.
+    #
+    # The old hard-mode optimizer does not include raw_mode_logit and cannot
+    # safely be restored for this experiment.
+    if checkpoint_data is not None:
+        print(
+            "[SOFT MODE RESUME] Using a fresh optimizer; "
+            "old optimizer state is intentionally not restored."
+        )
 
     gradient_stats = make_gradient_stats(
         len(neural_scene.slices)
@@ -2698,46 +2758,33 @@ def main():
             topology_changed = False
 
             if do_prune and len(neural_scene.slices) > 1:
-                # First use cheap visibility/opacity/projected-area statistics
-                # to rank weak candidates.
-                prune_candidates = choose_batched_prune_candidates(
-                    lifecycle_stats=lifecycle_stats,
-                    max_candidates=args.lifecycle_prune_candidates,
-                )
-            
-                prune_camera_count = min(
-                    int(args.prune_selection_cameras),
-                    len(cameras),
-                )
-            
-                prune_cameras = cameras[:prune_camera_count]
-            
-                # Then run expensive actual contribution tests only on those candidates.
-                prune_indices = choose_contribution_prune_indices(
-                    renderer=renderer,
-                    neural_scene=neural_scene,
-                    cameras=prune_cameras,
-                    candidate_indices=prune_candidates,
-                    max_prunes=args.max_prunes_per_update,
-                    contribution_threshold=args.contribution_threshold,
-                )
-            
-                if prune_indices:
-                    print(
-                        "[PRUNE] Removing contribution-tested slices:",
-                        prune_indices,
-                    )
-            
-                    prune_slices(
+                if args.opacity_prune_threshold > 0.0:
+                    prune_indices = choose_low_opacity_prune_candidates(
                         neural_scene=neural_scene,
-                        prune_indices=prune_indices,
+                        shared_sh=neural_scene.global_sh,
+                        opacity_threshold=args.opacity_prune_threshold,
+                        max_candidates=args.max_prunes_per_update,
                     )
             
-                    topology_changed = True
+                    # Always keep at least one slice.
+                    max_removable = max(0, len(neural_scene.slices) - 1)
+                    prune_indices = prune_indices[:max_removable]
             
-                    # Avoid splitting in the same topology-update cycle because
-                    # candidate statistics were calculated before pruning.
-                    do_split = False
+                    if prune_indices:
+                        print(
+                            "[OPACITY PRUNE] Removing low-opacity slices:",
+                            prune_indices,
+                        )
+            
+                        prune_slices(
+                            neural_scene=neural_scene,
+                            prune_indices=prune_indices,
+                        )
+            
+                        topology_changed = True
+            
+                        # Do not split in this same stale-statistics update.
+                        do_split = False
 
             if do_split:
                 split_candidates = choose_batched_split_candidates(
@@ -2758,7 +2805,7 @@ def main():
                     gradient_stats=gradient_summary,
                     max_splits=args.max_splits_per_update,
                     max_total_slices=max_total_slices,
-                    mode_selector=split_mode_selector,
+                    mode_selector=None,
                 )
 
                 if split_indices:
@@ -2832,6 +2879,20 @@ def main():
                 f"regularization={loss_regularization.item():.8f} "
                 f"grad_norm={gradient_norm.item():.6e} "
                 f"slices={len(neural_scene.slices)}"
+            )
+            
+            volume_weights = torch.stack(
+                [
+                    neural_slice.volume_weight.detach()
+                    for neural_slice in neural_scene.slices
+                ]
+            )
+
+            print(
+                "  soft volume weights: "
+                f"mean={volume_weights.mean().item():.4f} "
+                f"min={volume_weights.min().item():.4f} "
+                f"max={volume_weights.max().item():.4f}"
             )
 
     # --------------------------------------------------------

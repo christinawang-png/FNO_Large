@@ -1188,9 +1188,12 @@ def main():
             phi, theta = direction_to_phi_theta(direction)
 
             # Deterministic but distinct appearance sampling per sample/view.
-            appearance_rng = np.random.RandomState(
-                sample_id * 100_003 + view_idx * 101
-            )
+            appearance_seed = (
+                sample_id * 100_003
+                + view_idx * 101
+            ) % (2**32 - 1)
+            
+            appearance_rng = np.random.RandomState(appearance_seed)
 
             # ====================================================
             # SURFACE MODE

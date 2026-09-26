@@ -9,10 +9,15 @@
 
 # Keep Python and Slurm files anywhere under FNO_Large
 !*.py
+!*.slurm
 
 # Keep the entire gaussian_splatting_copy directory
 !/gaussian_splatting_copy/
 !/gaussian_splatting_copy/**
 
+# Ignore generated Gaussian Splatting outputs
+/gaussian_splatting_copy/output/
+/gaussian_splatting_copy/test_neural_scene/
+
+# Ignore job output files directly under gaussian_splatting_copy
 /gaussian_splatting_copy/*.out
-gaussian_splatting_copy/submit.slurm

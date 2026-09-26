@@ -336,6 +336,7 @@ def perturb_child_parameters(
     color_noise=0.05,
     opacity_noise=0.05,
     roughness_noise=0.05,
+    mode_noise=0.10,
 ):
     """
     Slightly perturb child raw parameters after splitting.
@@ -386,6 +387,13 @@ def perturb_child_parameters(
             child.raw_local_sh_delta.add_(
                 0.01 * torch.randn_like(
                     child.raw_local_sh_delta
+                )
+            )
+            
+        if hasattr(child, "raw_mode_logit"):
+            child.raw_mode_logit.add_(
+                mode_noise * torch.randn_like(
+                    child.raw_mode_logit
                 )
             )
 
@@ -896,3 +904,52 @@ def load_neural_scene_checkpoint(
         )
 
     return checkpoint
+    
+
+def choose_low_opacity_prune_candidates(
+    neural_scene,
+    shared_sh=None,
+    opacity_threshold=0.03,
+    max_candidates=2,
+):
+    """
+    Select slices whose learned scalar opacity is very low.
+
+    This is cheap:
+      - no extra rendering;
+      - no contribution leave-one-out testing;
+      - only evaluates scalar slice parameterization.
+
+    Parameters
+    ----------
+    opacity_threshold:
+        Prune slices when their current FNO opacity is <= this value.
+
+    max_candidates:
+        Maximum number of slice indices returned.
+
+    Returns
+    -------
+    list[int]
+        Slice indices sorted from lowest opacity upward.
+    """
+    candidates = []
+
+    for index, neural_slice in enumerate(neural_scene.slices):
+        values = neural_slice.fno_values(
+            shared_sh=shared_sh,
+        )
+
+        opacity = float(
+            values["opacity"].detach().cpu()
+        )
+
+        if opacity <= float(opacity_threshold):
+            candidates.append((opacity, index))
+
+    candidates.sort(key=lambda item: item[0])
+
+    return [
+        index
+        for _, index in candidates[:int(max_candidates)]
+    ]

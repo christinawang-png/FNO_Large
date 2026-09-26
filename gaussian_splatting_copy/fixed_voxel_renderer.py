@@ -8,21 +8,25 @@ Each FixedVoxelBlock has fixed center/world_size, but soft gates:
     volume_weight  = sigmoid(raw_mode_logit)
     surface_weight = 1 - volume_weight
 
-For every visible block:
+Every visible voxel evaluates both frozen models:
 
-    surface_patch = frozen_surface_fno(surface_features)
-    volume_patch  = frozen_volume_fno(volume_features)
+    surface_patch = surface_fno(surface_features)
+    volume_patch  = volume_fno(volume_features)
+
+Then its local premultiplied RGBA patch is blended:
 
     mixed_patch =
         surface_weight * surface_patch
         + volume_weight * volume_patch
 
-    final_patch = alive_weight * mixed_patch
+    final_patch =
+        alive_weight * mixed_patch
 
-The patch is premultiplied RGBA, so multiplying all four channels by
-alive_weight is valid.
+The final scene is depth-sorted far-to-near and alpha composited.
 
-The final per-camera render composites blocks far-to-near.
+Important:
+    - Euclidean camera-to-block radius is used for projected patch footprint.
+    - Camera-space Z depth is used for front/back compositing order.
 """
 
 from __future__ import annotations
@@ -44,17 +48,16 @@ from tile_patch_renderer import TilePatchRenderer
 
 def camera_to_block_pose(camera, block_center):
     """
-    Compute spherical camera direction relative to a fixed voxel center.
+    Compute spherical camera direction relative to a block center.
 
-    This exactly matches the conditioning used by train_implicit.py:
+    This matches the FNO conditioning convention:
 
         x = r sin(phi) cos(theta)
         y = r sin(phi) sin(theta)
         z = r cos(phi)
 
-    Returns
-    -------
-    phi, theta, radius, relative
+    Returns:
+        phi, theta, radius, relative
     """
     camera_center = camera.camera_center
 
@@ -91,11 +94,23 @@ def project_fixed_block_center(
     flip_projection_y=False,
 ):
     """
-    Project one fixed voxel center with the 3DGS row-vector convention.
+    Project a fixed voxel center using 3DGS row-vector transforms.
 
-    Returns
-    -------
-    pixel_x, pixel_y, ndc_z, valid_w
+    Returns:
+        pixel_x:
+            Full-image pixel x coordinate.
+
+        pixel_y:
+            Full-image pixel y coordinate.
+
+        ndc_z:
+            Normalized device-coordinate depth. Used for visibility testing.
+
+        camera_depth:
+            Camera-space Z coordinate. Use for far-to-near compositing.
+
+        valid_w:
+            True when homogeneous clip-space w is positive.
     """
     projection = camera.full_proj_transform
 
@@ -115,8 +130,15 @@ def project_fixed_block_center(
         ]
     )
 
-    # 3DGS convention: row-vector multiplication.
-    clip = point_h @ projection
+    # Camera-space point in the same row-vector convention as 3DGS.
+    #
+    # This is preferable to Euclidean radius for depth sorting because it
+    # represents front/back position along the camera's viewing direction.
+    camera_space = point_h @ camera.world_view_transform
+    camera_depth = camera_space[2]
+
+    # Clip/NDC coordinates are used for screen-space placement and visibility.
+    clip = point_h @ camera.full_proj_transform
 
     clip_w = clip[3]
     valid_w = clip_w > 1e-8
@@ -148,7 +170,7 @@ def project_fixed_block_center(
             * float(camera.image_height)
         )
 
-    return pixel_x, pixel_y, ndc[2], valid_w
+    return pixel_x, pixel_y, ndc[2], camera_depth, valid_w
 
 
 # ============================================================
@@ -162,10 +184,10 @@ def run_fno_in_chunks(
     use_activation_checkpointing=True,
 ):
     """
-    Run a frozen FNO on [N, D] vectors in chunks.
+    Evaluate frozen FNO model on [N, D] conditioning vectors.
 
-    The FNO parameters should have requires_grad=False, but gradients still
-    flow through params into the fixed voxel's learnable conditioning fields.
+    FNO parameters should have requires_grad=False. Gradients still flow
+    from output patches back through params into voxel parameters.
     """
     if params.ndim != 2:
         raise ValueError(
@@ -173,12 +195,17 @@ def run_fno_in_chunks(
         )
 
     if params.shape[0] == 0:
-        raise RuntimeError("Cannot evaluate FNO on an empty parameter batch.")
+        raise RuntimeError(
+            "Cannot evaluate FNO on an empty parameter batch."
+        )
 
     outputs = []
 
     for start in range(0, params.shape[0], int(batch_size)):
-        end = min(start + int(batch_size), params.shape[0])
+        end = min(
+            start + int(batch_size),
+            params.shape[0],
+        )
 
         parameter_chunk = params[start:end]
 
@@ -209,27 +236,19 @@ class FixedVoxelRenderer(nn.Module):
 
     Parameters
     ----------
-    surface_bundle, volume_bundle:
-        Dictionaries returned by a checkpoint loader, each containing:
+    camera_depth_sign:
+        Converts camera-space depth into a compositing depth convention where
+        larger values mean farther away.
 
-            {
-                "model": frozen FNO model,
-                "param_mean": numpy/tensor normalization mean,
-                "param_std": numpy/tensor normalization std,
-            }
+        Default:
+            +1.0
 
-    fno_radius:
-        Geometric projected-footprint scale only. It is not passed to the
-        FNO because camera radius was not a training feature.
+        If your 3DGS camera-space visible points have negative Z and more
+        distant points are more negative, use:
+            camera_depth_sign=-1.0
 
-    alive_cull_threshold:
-        Blocks with detached alive_weight below this threshold are skipped
-        completely. Set to 0.0 to evaluate all blocks regardless of life.
-
-    Notes
-    -----
-    Block locations and sizes are fixed. Therefore visibility culling is
-    safely detached/discrete: there are no center/size gradients to lose.
+    The renderer and TilePatchRenderer both expect:
+        larger compositing depth = farther
     """
 
     def __init__(
@@ -248,8 +267,14 @@ class FixedVoxelRenderer(nn.Module):
         active_slice_margin=64.0,
         alive_cull_threshold=1e-4,
         use_fno_activation_checkpointing=True,
+        camera_depth_sign=1.0,
     ):
         super().__init__()
+
+        if camera_depth_sign == 0.0:
+            raise ValueError(
+                "camera_depth_sign must be positive or negative, not zero."
+            )
 
         self.surface_model = surface_bundle["model"]
         self.volume_model = volume_bundle["model"]
@@ -272,7 +297,9 @@ class FixedVoxelRenderer(nn.Module):
             min_projected_patch_size
         )
 
-        self.active_slice_margin = float(active_slice_margin)
+        self.active_slice_margin = float(
+            active_slice_margin
+        )
 
         self.alive_cull_threshold = float(
             alive_cull_threshold
@@ -281,6 +308,8 @@ class FixedVoxelRenderer(nn.Module):
         self.use_fno_activation_checkpointing = bool(
             use_fno_activation_checkpointing
         )
+
+        self.camera_depth_sign = float(camera_depth_sign)
 
         self.tile_renderer = TilePatchRenderer(
             tile_size=int(tile_size),
@@ -295,7 +324,7 @@ class FixedVoxelRenderer(nn.Module):
                 parameter.requires_grad_(False)
 
     # ========================================================
-    # BLOCK CULLING / RECORD CONSTRUCTION
+    # BLOCK VISIBILITY / RECORDS
     # ========================================================
 
     def _block_is_potentially_visible(
@@ -304,18 +333,12 @@ class FixedVoxelRenderer(nn.Module):
         block,
     ):
         """
-        Discrete visibility test for a fixed block.
+        Detached/discrete visibility check.
 
-        Returns:
-            visible, center_x, center_y, depth, patch_size, radius,
-            phi, theta, relative
+        Fixed blocks do not optimize center/size, so this culling does not
+        remove placement gradients.
         """
-        (
-            phi,
-            theta,
-            radius,
-            relative,
-        ) = camera_to_block_pose(
+        phi, theta, radius, relative = camera_to_block_pose(
             camera,
             block.center,
         )
@@ -324,6 +347,7 @@ class FixedVoxelRenderer(nn.Module):
             center_x,
             center_y,
             ndc_depth,
+            camera_depth,
             valid_w,
         ) = project_fixed_block_center(
             camera,
@@ -334,6 +358,7 @@ class FixedVoxelRenderer(nn.Module):
         image_height = float(camera.image_height)
         image_width = float(camera.image_width)
 
+        # Radius is only used for projected patch footprint.
         patch_size = (
             image_height
             * block.world_size
@@ -341,8 +366,6 @@ class FixedVoxelRenderer(nn.Module):
             / radius
         )
 
-        # Fixed block center/size means this detached Python visibility
-        # decision does not eliminate placement gradients.
         visible = (
             bool(valid_w.detach())
             and float(ndc_depth.detach()) > 0.0
@@ -361,6 +384,7 @@ class FixedVoxelRenderer(nn.Module):
             center_x,
             center_y,
             ndc_depth,
+            camera_depth,
             patch_size,
             radius,
             phi,
@@ -374,15 +398,14 @@ class FixedVoxelRenderer(nn.Module):
         voxel_scene,
     ):
         """
-        Build one differentiable render record for each visible/alive block.
+        Build differentiable records for visible blocks.
         """
         records = []
 
         for key, block in voxel_scene.iter_blocks_with_keys():
             alive_weight = block.alive_weight
 
-            # Discrete performance culling only. The alive state remains
-            # differentiable for blocks above this threshold.
+            # Cheap discrete culling of nearly dead blocks.
             if (
                 float(alive_weight.detach())
                 < self.alive_cull_threshold
@@ -394,6 +417,7 @@ class FixedVoxelRenderer(nn.Module):
                 center_x,
                 center_y,
                 ndc_depth,
+                camera_depth,
                 patch_size,
                 radius,
                 phi,
@@ -429,6 +453,13 @@ class FixedVoxelRenderer(nn.Module):
                 shared_sh=voxel_scene.global_sh,
             )
 
+            # Convert raw camera-space Z to convention expected by compositors:
+            #
+            # larger depth = farther.
+            compositing_depth = (
+                self.camera_depth_sign * camera_depth
+            )
+
             records.append(
                 {
                     "key": key,
@@ -441,8 +472,13 @@ class FixedVoxelRenderer(nn.Module):
                     "center_x": center_x,
                     "center_y": center_y,
                     "patch_size": patch_size,
-                    # Larger radius = farther for compositing.
-                    "depth": radius,
+
+                    # Used by both ROI and tile compositors.
+                    "depth": compositing_depth,
+
+                    # Diagnostics only.
+                    "camera_depth": camera_depth,
+                    "radius": radius,
                     "ndc_depth": ndc_depth,
                     "phi": phi,
                     "theta": theta,
@@ -453,28 +489,32 @@ class FixedVoxelRenderer(nn.Module):
         return records
 
     # ========================================================
-    # PATCH EVALUATION / BLENDING
+    # FNO PATCH EVALUATION / SOFT BLENDING
     # ========================================================
 
     def _evaluate_blended_patches(self, records):
         """
-        Evaluate both FNOs for all visible blocks and blend per block.
-
-        Returns:
-            patches [N,4,Hpatch,Wpatch]
+        Evaluate both FNOs for every block, then blend local premultiplied
+        RGBA using soft surface/volume mode weights.
         """
         if not records:
             raise RuntimeError(
-                "Cannot evaluate FNO patches for zero records."
+                "Cannot evaluate patches for zero visible records."
             )
 
         surface_params = torch.cat(
-            [record["surface_params"] for record in records],
+            [
+                record["surface_params"]
+                for record in records
+            ],
             dim=0,
         )
 
         volume_params = torch.cat(
-            [record["volume_params"] for record in records],
+            [
+                record["volume_params"]
+                for record in records
+            ],
             dim=0,
         )
 
@@ -508,30 +548,37 @@ class FixedVoxelRenderer(nn.Module):
             )
 
         surface_weights = torch.stack(
-            [record["surface_weight"] for record in records],
+            [
+                record["surface_weight"]
+                for record in records
+            ],
             dim=0,
         ).view(-1, 1, 1, 1)
 
         volume_weights = torch.stack(
-            [record["volume_weight"] for record in records],
+            [
+                record["volume_weight"]
+                for record in records
+            ],
             dim=0,
         ).view(-1, 1, 1, 1)
 
         alive_weights = torch.stack(
-            [record["alive_weight"] for record in records],
+            [
+                record["alive_weight"]
+                for record in records
+            ],
             dim=0,
         ).view(-1, 1, 1, 1)
 
-        # Convex blend of premultiplied RGBA is valid.
         mixed_patches = (
             surface_weights * surface_patches
             + volume_weights * volume_patches
         )
 
-        # Soft occupancy scales both premultiplied RGB and alpha.
-        final_patches = alive_weights * mixed_patches
-
-        return final_patches
+        # Patches are premultiplied RGBA, so scaling both RGB and alpha by
+        # soft occupancy is appropriate.
+        return alive_weights * mixed_patches
 
     # ========================================================
     # MAIN RENDER
@@ -544,11 +591,11 @@ class FixedVoxelRenderer(nn.Module):
         collect_diagnostics=False,
     ):
         """
-        Render a FixedVoxelScene from one 3DGS camera.
+        Render a FixedVoxelScene from one camera.
 
         Returns:
-            rgba: [1,4,H,W]
-            diagnostics: list[dict]
+            rgba: [1, 4, H, W]
+            diagnostics: list of Python dicts
         """
         canvas_height = int(camera.image_height)
         canvas_width = int(camera.image_width)
@@ -574,32 +621,46 @@ class FixedVoxelRenderer(nn.Module):
         patches = self._evaluate_blended_patches(records)
 
         center_x = torch.stack(
-            [record["center_x"] for record in records],
+            [
+                record["center_x"]
+                for record in records
+            ],
             dim=0,
         )
 
         center_y = torch.stack(
-            [record["center_y"] for record in records],
+            [
+                record["center_y"]
+                for record in records
+            ],
             dim=0,
         )
 
         patch_sizes = torch.stack(
-            [record["patch_size"] for record in records],
+            [
+                record["patch_size"]
+                for record in records
+            ],
             dim=0,
         )
 
         depths = torch.stack(
-            [record["depth"] for record in records],
+            [
+                record["depth"]
+                for record in records
+            ],
             dim=0,
         )
 
-        # Far -> near. Larger camera-center distance means farther.
+        # Larger compositing depth is farther.
         sort_indices = torch.argsort(
             depths.detach(),
             descending=True,
         )
 
         if self.use_tile_renderer:
+            # TilePatchRenderer independently sorts each tile by the same
+            # depth convention: larger means farther.
             rgba = self.tile_renderer(
                 patches=patches,
                 center_x=center_x,
@@ -625,6 +686,16 @@ class FixedVoxelRenderer(nn.Module):
         diagnostics = []
 
         if collect_diagnostics:
+            depth_values = depths.detach()
+
+            print(
+                "[DEPTH DEBUG] "
+                f"composite_depth=["
+                f"{depth_values.min().item():.5f}, "
+                f"{depth_values.max().item():.5f}], "
+                f"depth_sign={self.camera_depth_sign:+.1f}"
+            )
+
             for record_index in sort_indices.detach().cpu().tolist():
                 record = records[record_index]
                 block = record["block"]
@@ -640,7 +711,13 @@ class FixedVoxelRenderer(nn.Module):
                         "center_x": record["center_x"],
                         "center_y": record["center_y"],
                         "patch_size": record["patch_size"],
+
+                        # Depth used for sorting.
                         "depth": record["depth"],
+
+                        # Raw diagnostics.
+                        "camera_depth": record["camera_depth"],
+                        "radius": record["radius"],
                         "ndc_depth": record["ndc_depth"],
                         "phi": record["phi"],
                         "theta": record["theta"],

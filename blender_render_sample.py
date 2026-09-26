@@ -4,20 +4,22 @@ import matplotlib.pyplot as plt
 from pathlib import Path
 
 # ---- paths ----
-base_dir   = Path("implicit_bspline_dataset")
-render_dir = base_dir / "renders"
-alpha_dir  = base_dir / "hard_alpha"
+PROJECT_ROOT = Path(__file__).resolve().parent
+base_dir   = PROJECT_ROOT / "implicit_bspline_dataset"
+image_dir = base_dir / "renders_balanced"
+alpha_dir  = base_dir / "hard_alpha_balanced"
+render_dir = base_dir / "volumes"
 
-job_id     = "job0"
-shard_idx  = 800   # debug_shard_000
+job_id     = "test512_22736647"
+shard_idx  = 0   # debug_shard_000
 
 # RGB metadata + shard
-rgb_csv   = render_dir / f"metadata_{job_id}_shard_{shard_idx:03d}.csv"
-rgb_npy   = render_dir / f"images_64x64_{job_id}_shard_{shard_idx:03d}.npy"
+rgb_csv   = image_dir / f"metadata_{job_id}_shard_{shard_idx:04d}.csv"
+rgb_npy   = image_dir / f"images_32x32_{job_id}_shard_{shard_idx:04d}.npy"
 
 # alpha metadata + shard
-alpha_csv = alpha_dir / f"metadata_alpha_{job_id}_shard_{shard_idx:03d}.csv"
-alpha_npy = alpha_dir / f"alpha_64x64_{job_id}_shard_{shard_idx:03d}.npy"
+alpha_csv = alpha_dir / f"metadata_alpha_{job_id}_shard_{shard_idx:04d}.csv"
+alpha_npy = alpha_dir / f"alpha_32x32_{job_id}_shard_{shard_idx:04d}.npy"
 
 out_dir = Path("debug_previews")
 out_dir.mkdir(parents=True, exist_ok=True)

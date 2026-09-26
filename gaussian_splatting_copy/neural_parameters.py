@@ -1,25 +1,20 @@
 #!/usr/bin/env python
 """
-Learnable local scene parameters for the implicit B-spline neural renderer.
+Learnable moving neural slices with a soft surface/volume gate.
 
-This file is compatible with the current separately trained surface and
-volume FNO checkpoints from train_implicit.py.
+Compatible with the current separately trained implicit B-spline FNO models.
 
-Checkpoint feature order:
+The old hard `mode` field remains for:
+    - loading old checkpoints;
+    - initializing raw_mode_logit;
+    - lifecycle/checkpoint metadata.
 
-    ctrl_0_0_0 ... ctrl_1_1_1                  8
-    sigma                                       1
-    base_color_r, base_color_g, base_color_b    3
-    metallic, roughness, specular               3
-    opacity                                     1
-    sin(phi), cos(phi), sin(theta), cos(theta)  4
-    SH coefficients, order-2 RGB                27
-                                                ---
-                                                47 total
+The renderer should no longer use mode as a hard selection. Instead, it
+evaluates both FNOs for every slice and blends their premultiplied RGBA
+patches using:
 
-There is no camera radius feature and no is_volume feature because:
-  - radius was constant during training;
-  - surface and volume use separate trained models.
+    volume_weight = sigmoid(raw_mode_logit)
+    surface_weight = 1 - volume_weight
 """
 
 from __future__ import annotations
@@ -34,57 +29,41 @@ import torch.nn as nn
 # TRAINING-DISTRIBUTION BOUNDS
 # ============================================================
 
-# Four-level training controls were:
-#
-# [-0.5, -0.1667, 0.1667, 0.5]
-#
-# The learnable renderer permits continuous values in the same full range.
 CTRL_LOW = -0.5
 CTRL_HIGH = 0.5
 
-# Gaussian thickness in normalized world-space units.
 SIGMA_LOW = 0.02
 SIGMA_HIGH = 0.70
 
-# Renderer sampled opacity uniformly in this range.
 OPACITY_LOW = 0.01
 OPACITY_HIGH = 0.99
 
-# Surface-only roughness range.
 ROUGHNESS_LOW = 0.10
 ROUGHNESS_HIGH = 0.90
 
-# Base color range.
 COLOR_LOW = 0.02
 COLOR_HIGH = 1.00
 
-# Current SH lighting uses order 2:
-#
-# 1 + 3 + 5 = 9 SH basis coefficients, each with RGB.
+NUM_CTRL_VALUES = 8
+
 NUM_SH_BASIS = 9
 NUM_SH_CHANNELS = 3
 NUM_SH_VALUES = NUM_SH_BASIS * NUM_SH_CHANNELS
 
-NUM_CTRL_VALUES = 8
 FNO_FEATURE_DIM = 47
 
 
 # ============================================================
-# BOUNDED PARAMETERIZATION
+# NUMERICAL HELPERS
 # ============================================================
 
 def inverse_bounded(value, low, high, eps=0.02):
-    """
-    Map a physical bounded scalar to a stable sigmoid-logit parameter.
-
-    Values exactly at bounds are moved slightly inward so optimization begins
-    outside sigmoid saturation.
-    """
+    """Convert a bounded physical value to a stable raw sigmoid logit."""
     value = float(value)
     low = float(low)
     high = float(high)
 
-    if not high > low:
+    if high <= low:
         raise ValueError(
             f"Expected high > low, got low={low}, high={high}"
         )
@@ -93,20 +72,12 @@ def inverse_bounded(value, low, high, eps=0.02):
     normalized = min(max(normalized, eps), 1.0 - eps)
 
     return torch.logit(
-        torch.tensor(
-            normalized,
-            dtype=torch.float32,
-        )
+        torch.tensor(normalized, dtype=torch.float32)
     )
 
 
 def bounded(raw, low, high):
-    """
-    Map an unconstrained raw parameter into [low, high].
-
-    The raw clamp prevents extremely saturated sigmoid values and keeps
-    optimization numerically stable.
-    """
+    """Map an unconstrained raw scalar/tensor into [low, high]."""
     raw = raw.clamp(-12.0, 12.0)
 
     return float(low) + (
@@ -114,33 +85,27 @@ def bounded(raw, low, high):
     ) * torch.sigmoid(raw)
 
 
+def probability_to_logit(probability, eps=1e-4):
+    """Convert an initial probability in [0,1] into a finite logit."""
+    probability = float(probability)
+    probability = min(max(probability, eps), 1.0 - eps)
+
+    return torch.logit(
+        torch.tensor(probability, dtype=torch.float32)
+    )
+
+
 # ============================================================
-# LEARNABLE SLICE
+# LEARNABLE NEURAL SLICE
 # ============================================================
 
 class LearnableNeuralSlice(nn.Module):
     """
-    One local learnable neural-rendering slice.
+    One freely movable neural slice.
 
-    The pretrained FNO network is frozen and lives outside this class.
-    This class stores the learnable quantities used to construct its
-    conditioning vector:
-
-      - world-space placement and size;
-      - 8 implicit B-spline corner controls;
-      - sigma;
-      - base RGB;
-      - opacity;
-      - roughness for surface slices;
-      - optional local SH lighting residual.
-
-    SH representation:
-
-        effective_SH = shared_global_SH + local_SH_delta
-
-    if shared_global_SH is supplied to fno_values(). Otherwise:
-
-        effective_SH = initial_SH + local_SH_delta
+    FNO weights are frozen externally. This module owns scene parameters:
+        center, world size, implicit controls, sigma, RGB, opacity,
+        roughness, local SH, and soft surface/volume gate.
     """
 
     def __init__(
@@ -159,7 +124,7 @@ class LearnableNeuralSlice(nn.Module):
         metallic=0.0,
         specular=0.5,
         optimize_environment=True,
-        local_sh_bound=0.01,
+        local_sh_bound=0.005,
     ):
         super().__init__()
 
@@ -168,12 +133,15 @@ class LearnableNeuralSlice(nn.Module):
                 f"mode must be 'surface' or 'volume', got '{mode}'"
             )
 
+        # Legacy checkpoint/init label. The renderer should use the soft
+        # mode gate below rather than this field for hard model selection.
         self.mode = str(mode)
-        self.local_sh_bound = float(local_sh_bound)
+
         self.optimize_environment = bool(optimize_environment)
+        self.local_sh_bound = float(local_sh_bound)
 
         # ----------------------------------------------------
-        # World-space placement
+        # Placement
         # ----------------------------------------------------
 
         center = torch.as_tensor(
@@ -183,7 +151,7 @@ class LearnableNeuralSlice(nn.Module):
 
         if center.numel() != 3:
             raise ValueError(
-                f"center must contain 3 values, got shape {tuple(center.shape)}"
+                f"center must contain 3 values, got {tuple(center.shape)}"
             )
 
         world_size = float(world_size)
@@ -195,7 +163,6 @@ class LearnableNeuralSlice(nn.Module):
 
         self.center = nn.Parameter(center.clone())
 
-        # world_size = exp(raw_world_size), with a safety clamp in property.
         self.raw_world_size = nn.Parameter(
             torch.tensor(
                 math.log(max(world_size, 1e-4)),
@@ -204,7 +171,7 @@ class LearnableNeuralSlice(nn.Module):
         )
 
         # ----------------------------------------------------
-        # Implicit B-spline shape parameters
+        # Implicit shape
         # ----------------------------------------------------
 
         ctrl_values = torch.as_tensor(
@@ -214,19 +181,14 @@ class LearnableNeuralSlice(nn.Module):
 
         if ctrl_values.numel() != NUM_CTRL_VALUES:
             raise ValueError(
-                f"Expected {NUM_CTRL_VALUES} control values for a 2x2x2 "
-                f"implicit B-spline, got {ctrl_values.numel()} values "
-                f"with shape {tuple(ctrl_values.shape)}."
+                f"Expected {NUM_CTRL_VALUES} control values, got "
+                f"{ctrl_values.numel()}."
             )
 
         self.raw_ctrl = nn.Parameter(
             torch.stack(
                 [
-                    inverse_bounded(
-                        value,
-                        CTRL_LOW,
-                        CTRL_HIGH,
-                    )
+                    inverse_bounded(value, CTRL_LOW, CTRL_HIGH)
                     for value in ctrl_values
                 ]
             )
@@ -241,7 +203,7 @@ class LearnableNeuralSlice(nn.Module):
         )
 
         # ----------------------------------------------------
-        # Appearance parameters
+        # Appearance
         # ----------------------------------------------------
 
         self.raw_base_color_r = nn.Parameter(
@@ -284,26 +246,35 @@ class LearnableNeuralSlice(nn.Module):
             )
         )
 
-        # The dataset used metallic ∈ {0, 1}, and fixed specular=0.5.
-        # Keep them fixed in this initial implementation.
         self.register_buffer(
             "metallic_value",
-            torch.tensor(
-                float(metallic),
-                dtype=torch.float32,
-            ),
+            torch.tensor(float(metallic), dtype=torch.float32),
         )
 
         self.register_buffer(
             "specular_value",
-            torch.tensor(
-                float(specular),
-                dtype=torch.float32,
-            ),
+            torch.tensor(float(specular), dtype=torch.float32),
         )
 
         # ----------------------------------------------------
-        # SH environment / local lighting
+        # Soft surface/volume mode gate
+        #
+        # This is new and absent from old hard-mode checkpoints.
+        # The old mode determines a near-hard initial state.
+        # ----------------------------------------------------
+
+        initial_volume_probability = (
+            0.95 if mode == "volume" else 0.05
+        )
+
+        self.raw_mode_logit = nn.Parameter(
+            probability_to_logit(
+                initial_volume_probability
+            )
+        )
+
+        # ----------------------------------------------------
+        # Lighting
         # ----------------------------------------------------
 
         sh_values = torch.as_tensor(
@@ -313,12 +284,10 @@ class LearnableNeuralSlice(nn.Module):
 
         if sh_values.numel() != NUM_SH_VALUES:
             raise ValueError(
-                "Expected order-2 RGB SH values with either shape [9, 3] "
-                f"or [27]; got shape {tuple(sh_values.shape)} with "
-                f"{sh_values.numel()} values."
+                f"Expected {NUM_SH_VALUES} SH values, got "
+                f"{sh_values.numel()}."
             )
 
-        # Keep a consistent [9, 3] layout internally.
         sh_values = sh_values.reshape(
             NUM_SH_BASIS,
             NUM_SH_CHANNELS,
@@ -335,20 +304,14 @@ class LearnableNeuralSlice(nn.Module):
         )
 
         # ----------------------------------------------------
-        # Initial-value regularization anchors
+        # Regularization anchors
         # ----------------------------------------------------
 
-        self.register_buffer(
-            "initial_center",
-            center.clone(),
-        )
+        self.register_buffer("initial_center", center.clone())
 
         self.register_buffer(
             "initial_world_size",
-            torch.tensor(
-                world_size,
-                dtype=torch.float32,
-            ),
+            torch.tensor(world_size, dtype=torch.float32),
         )
 
         self.register_buffer(
@@ -358,78 +321,67 @@ class LearnableNeuralSlice(nn.Module):
 
         self.register_buffer(
             "initial_sigma",
-            torch.tensor(
-                float(sigma),
-                dtype=torch.float32,
-            ),
+            torch.tensor(float(sigma), dtype=torch.float32),
         )
 
         self.register_buffer(
             "initial_base_color_r",
-            torch.tensor(
-                float(base_color_r),
-                dtype=torch.float32,
-            ),
+            torch.tensor(float(base_color_r), dtype=torch.float32),
         )
 
         self.register_buffer(
             "initial_base_color_g",
-            torch.tensor(
-                float(base_color_g),
-                dtype=torch.float32,
-            ),
+            torch.tensor(float(base_color_g), dtype=torch.float32),
         )
 
         self.register_buffer(
             "initial_base_color_b",
-            torch.tensor(
-                float(base_color_b),
-                dtype=torch.float32,
-            ),
+            torch.tensor(float(base_color_b), dtype=torch.float32),
         )
 
         self.register_buffer(
             "initial_opacity",
-            torch.tensor(
-                float(opacity),
-                dtype=torch.float32,
-            ),
+            torch.tensor(float(opacity), dtype=torch.float32),
         )
 
         self.register_buffer(
             "initial_roughness",
-            torch.tensor(
-                float(roughness),
-                dtype=torch.float32,
-            ),
+            torch.tensor(float(roughness), dtype=torch.float32),
         )
 
     # ========================================================
-    # DIFFERENTIABLE PROPERTIES
+    # PROPERTIES
     # ========================================================
 
     @property
     def world_size(self):
-        """
-        Current scalar world-space slice size.
-
-        Clamped to a practical range before exponentiation.
-        """
-        safe_raw_world_size = self.raw_world_size.clamp(
+        safe_raw_size = self.raw_world_size.clamp(
             min=math.log(0.05),
             max=math.log(5.0),
         )
 
-        return torch.exp(safe_raw_world_size)
+        return torch.exp(safe_raw_size)
+
+    @property
+    def volume_weight(self):
+        """Differentiable local probability of volume rendering."""
+        return torch.sigmoid(self.raw_mode_logit)
+
+    @property
+    def surface_weight(self):
+        """Differentiable local probability of surface rendering."""
+        return 1.0 - self.volume_weight
+
+    @property
+    def hard_mode(self):
+        """Convenience non-differentiable mode label for diagnostics."""
+        if float(self.volume_weight.detach()) >= 0.5:
+            return "volume"
+
+        return "surface"
 
     @property
     def local_sh_delta(self):
-        """
-        Bounded local SH lighting perturbation.
-
-        If environment optimization is disabled, return exact zero without
-        depending on the raw parameter.
-        """
         if not self.optimize_environment:
             return torch.zeros_like(self.raw_local_sh_delta)
 
@@ -438,20 +390,36 @@ class LearnableNeuralSlice(nn.Module):
         )
 
     # ========================================================
-    # FNO CONDITIONING VALUES
+    # FNO VALUES
     # ========================================================
 
-    def fno_values(self, shared_sh=None):
+    def fno_values(
+        self,
+        mode=None,
+        shared_sh=None,
+    ):
         """
-        Return differentiable values used by the pretrained FNO model.
+        Return physical FNO conditioning values.
 
-        Returned keys match the current training feature schema.
+        Parameters
+        ----------
+        mode:
+            Explicit "surface" or "volume" request.
 
-        For volume mode:
-          metallic = roughness = specular = 0
+            If None, preserves old hard-mode behavior via self.mode.
+            Lifecycle/checkpoint code may use this default.
 
-        because volume training stored those surface-only fields as zeros.
+        shared_sh:
+            Optional current scene/global SH tensor.
         """
+        if mode is None:
+            mode = self.mode
+
+        if mode not in {"surface", "volume"}:
+            raise ValueError(
+                f"mode must be surface or volume, got '{mode}'"
+            )
+
         ctrl = bounded(
             self.raw_ctrl,
             CTRL_LOW,
@@ -494,14 +462,16 @@ class LearnableNeuralSlice(nn.Module):
             ROUGHNESS_HIGH,
         )
 
-        if self.mode == "volume":
-            metallic = torch.zeros_like(opacity)
-            roughness_for_fno = torch.zeros_like(opacity)
-            specular = torch.zeros_like(opacity)
-        else:
+        if mode == "surface":
             metallic = self.metallic_value
             roughness_for_fno = current_roughness
             specular = self.specular_value
+        else:
+            zero = torch.zeros_like(opacity)
+
+            metallic = zero
+            roughness_for_fno = zero
+            specular = zero
 
         if shared_sh is None:
             base_sh = self.initial_sh
@@ -514,8 +484,8 @@ class LearnableNeuralSlice(nn.Module):
 
             if base_sh.numel() != NUM_SH_VALUES:
                 raise ValueError(
-                    "shared_sh must contain 27 values / have shape [9, 3], "
-                    f"received {tuple(base_sh.shape)}."
+                    f"Expected {NUM_SH_VALUES} shared SH values, got "
+                    f"{base_sh.numel()}."
                 )
 
             base_sh = base_sh.reshape(
@@ -542,14 +512,20 @@ class LearnableNeuralSlice(nn.Module):
     # REGULARIZATION
     # ========================================================
 
-    def regularization_loss(self, shared_sh=None):
+    def regularization_loss(
+        self,
+        shared_sh=None,
+        mode_entropy_weight=0.0,
+    ):
         """
-        Softly keep optimized slice parameters near their initialization.
+        Per-slice regularization.
 
-        The FNO itself stays frozen; this regularizes only local scene
-        conditioning and placement parameters.
+        mode_entropy_weight should initially remain 0.0. Later it may be
+        increased slightly to encourage a near-binary surface/volume choice.
         """
-        values = self.fno_values(shared_sh=shared_sh)
+        values = self.fno_values(
+            shared_sh=shared_sh,
+        )
 
         loss = torch.zeros(
             (),
@@ -557,7 +533,6 @@ class LearnableNeuralSlice(nn.Module):
             device=self.center.device,
         )
 
-        # Placement and scale.
         loss = loss + 1e-5 * torch.mean(
             (self.center - self.initial_center).square()
         )
@@ -568,7 +543,6 @@ class LearnableNeuralSlice(nn.Module):
 
         loss = loss + 1e-3 * relative_size_change.square()
 
-        # Shape and volume thickness.
         loss = loss + 1e-5 * torch.mean(
             (values["ctrl"] - self.initial_ctrl).square()
         )
@@ -577,7 +551,6 @@ class LearnableNeuralSlice(nn.Module):
             values["sigma"] - self.initial_sigma
         ).square()
 
-        # Appearance.
         loss = loss + 1e-5 * (
             values["base_color_r"] - self.initial_base_color_r
         ).square()
@@ -594,25 +567,45 @@ class LearnableNeuralSlice(nn.Module):
             values["opacity"] - self.initial_opacity
         ).square()
 
-        if self.mode == "surface":
-            loss = loss + 1e-5 * (
-                values["roughness"] - self.initial_roughness
-            ).square()
+        # This is harmless even for a legacy volume slice because mode=None
+        # makes its roughness FNO value zero. The raw parameter itself can
+        # still be anchored gently.
+        loss = loss + 1e-5 * (
+            bounded(
+                self.raw_roughness,
+                ROUGHNESS_LOW,
+                ROUGHNESS_HIGH,
+            ) - self.initial_roughness
+        ).square()
 
-        # Local SH residual is intentionally tightly controlled.
         loss = loss + 1e-2 * torch.mean(
             self.local_sh_delta.square()
         )
+
+        if mode_entropy_weight > 0.0:
+            p_volume = self.volume_weight.clamp(
+                1e-6,
+                1.0 - 1e-6,
+            )
+
+            entropy = -(
+                p_volume * torch.log(p_volume)
+                + (1.0 - p_volume)
+                * torch.log(1.0 - p_volume)
+            )
+
+            loss = loss + float(mode_entropy_weight) * entropy
 
         return loss
 
 
 # ============================================================
-# FNO FEATURE-VECTOR CONSTRUCTION
+# CHECKPOINT-CONDITIONING VECTOR
 # ============================================================
 
 def build_tensor_fno_vector(
     neural_slice,
+    mode,
     param_mean,
     param_std,
     phi,
@@ -621,42 +614,25 @@ def build_tensor_fno_vector(
     shared_sh=None,
 ):
     """
-    Construct one normalized FNO conditioning vector.
+    Build normalized [1,47] input for either the surface or volume FNO.
 
-    Feature order must exactly match build_raw_feature_matrix() in
-    implicit_dataset.py:
+    Feature order must match the trained checkpoints:
 
-        ctrl_0_0_0 ... ctrl_1_1_1                 8
-        sigma                                      1
-        base_color_r, base_color_g, base_color_b   3
-        metallic, roughness, specular              3
-        opacity                                    1
-        sin(phi), cos(phi), sin(theta), cos(theta) 4
-        flattened SH [l,m,r/g/b]                   27
-
-    Total: 47 scalar features.
-
-    Parameters
-    ----------
-    neural_slice:
-        LearnableNeuralSlice instance.
-
-    param_mean, param_std:
-        Arrays from the corresponding trained checkpoint.
-
-    phi, theta:
-        Scalar torch tensors in radians.
-
-    device:
-        Optional explicit device. Defaults to neural_slice.center.device.
-
-    shared_sh:
-        Optional scene/global SH tensor with shape [9,3] or [27].
+        8 ctrl
+        sigma
+        RGB
+        metallic, roughness, specular
+        opacity
+        sin(phi), cos(phi), sin(theta), cos(theta)
+        27 SH values
     """
+    if mode not in {"surface", "volume"}:
+        raise ValueError(
+            f"mode must be surface or volume, got '{mode}'"
+        )
+
     if device is None:
         device = neural_slice.center.device
-
-    values = neural_slice.fno_values(shared_sh=shared_sh)
 
     phi = torch.as_tensor(
         phi,
@@ -670,15 +646,17 @@ def build_tensor_fno_vector(
         device=device,
     )
 
+    values = neural_slice.fno_values(
+        mode=mode,
+        shared_sh=shared_sh,
+    )
+
     scalars = []
 
-    # Eight control-grid values in z/y/x flattening order.
     scalars.extend(values["ctrl"].reshape(-1).unbind())
 
-    # Shape thickness.
     scalars.append(values["sigma"])
 
-    # Base RGB.
     scalars.extend(
         [
             values["base_color_r"],
@@ -687,8 +665,7 @@ def build_tensor_fno_vector(
         ]
     )
 
-    # This exact order must match training:
-    # metallic, roughness, specular, opacity.
+    # Exact trained order.
     scalars.extend(
         [
             values["metallic"],
@@ -698,7 +675,6 @@ def build_tensor_fno_vector(
         ]
     )
 
-    # Camera direction encoding.
     scalars.extend(
         [
             torch.sin(phi),
@@ -708,17 +684,14 @@ def build_tensor_fno_vector(
         ]
     )
 
-    # [9,3] -> [27] in the same row-major ordering as pandas SH columns:
-    #
-    # l0,m0 RGB; l1,m-1 RGB; l1,m0 RGB; ...
     scalars.extend(values["sh"].reshape(-1).unbind())
 
     raw = torch.stack(scalars)
 
     if raw.numel() != FNO_FEATURE_DIM:
         raise RuntimeError(
-            f"Internal feature construction produced {raw.numel()} values; "
-            f"expected {FNO_FEATURE_DIM}."
+            f"Built {raw.numel()} FNO inputs, expected "
+            f"{FNO_FEATURE_DIM}."
         )
 
     param_mean = torch.as_tensor(
@@ -735,19 +708,14 @@ def build_tensor_fno_vector(
 
     if param_mean.numel() != raw.numel():
         raise RuntimeError(
-            "FNO feature dimension mismatch:\n"
-            f"  raw constructed features: {raw.numel()}\n"
-            f"  checkpoint param_mean:    {param_mean.numel()}\n"
-            f"  checkpoint param_std:     {param_std.numel()}\n"
-            "Check that the correct surface/volume checkpoint is being "
-            "used and that its training feature schema matches this file."
+            f"FNO mean mismatch: raw={raw.numel()}, "
+            f"mean={param_mean.numel()}."
         )
 
     if param_std.numel() != raw.numel():
         raise RuntimeError(
-            "FNO parameter-standard-deviation dimension mismatch:\n"
-            f"  raw constructed features: {raw.numel()}\n"
-            f"  checkpoint param_std:     {param_std.numel()}"
+            f"FNO std mismatch: raw={raw.numel()}, "
+            f"std={param_std.numel()}."
         )
 
     return ((raw - param_mean) / param_std).unsqueeze(0)
