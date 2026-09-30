@@ -63,6 +63,7 @@ from fixed_voxel_scene import (
     make_blocks_from_voxel_seeds,
     root_grid_index_from_center,
     split_scene_block,
+    FixedVoxelBlock,
 )
 
 from fixed_voxel_renderer import FixedVoxelRenderer
@@ -118,22 +119,29 @@ FNO_RADIUS = 2.2
 BACKGROUND_RGB = (0.0, 0.0, 0.0)
 
 # Fixed-voxel optimization learning rates.
-SHAPE_LR = 2e-2
-MATERIAL_LR = 3e-3
-GATE_LR = 2e-3
+SHAPE_LR = 5e-2
+MATERIAL_LR = 7e-2
 
-# Keep SH optional and conservative initially.
-LOCAL_SH_LR = 1e-4
-GLOBAL_SH_LR = 1e-3
+# Alive gate can optimize from the start.
+ALIVE_GATE_LR = 5e-2
+
+# Surface/volume mode gate is deliberately delayed.
+MODE_LR = 5e-2
+MODE_START_ITERS = 1200
+
+# Lighting begins immediately when --optimize_sh is used.
+# These are intentionally visible/debuggable values.
+LOCAL_SH_LR = 1e-3
+GLOBAL_SH_LR = 1e-2
 
 MAX_GRAD_NORM = 1.0
 
 # Regularization.
-PARAMETER_REG_WEIGHT = 1.0
+PARAMETER_REG_WEIGHT = 0.1
 ALIVE_REG_WEIGHT = 1e-5
 MODE_ENTROPY_WEIGHT = 0.0
 
-GLOBAL_SH_BOUND = 0.005
+GLOBAL_SH_BOUND = 0.05
 GLOBAL_SH_REG_WEIGHT = 1e-2
 
 
@@ -407,16 +415,23 @@ def make_block_initialization(
 # OPTIMIZER / LOSSES
 # ============================================================
 
-def make_optimizer(voxel_scene, optimize_sh):
+def make_optimizer(
+    voxel_scene,
+    optimize_sh,
+    optimize_mode,
+):
     """
-    Construct a fresh optimizer.
+    Build optimizer for the current fixed voxel topology.
 
-    Rebuild this optimizer after future split/death/activation topology
-    changes, because ModuleDict parameters will have changed.
+    Important scheduling behavior:
+        - shape/material/alive parameters optimize from iteration 0;
+        - SH optimizes from iteration 0 when --optimize_sh is enabled;
+        - surface/volume mode logits optimize only after MODE_START_ITERS.
     """
     shape_parameters = []
     material_parameters = []
-    gate_parameters = []
+    alive_gate_parameters = []
+    mode_gate_parameters = []
     local_sh_parameters = []
 
     for block in voxel_scene.blocks.values():
@@ -437,18 +452,23 @@ def make_optimizer(voxel_scene, optimize_sh):
             ]
         )
 
-        gate_parameters.extend(
-            [
-                block.raw_alive_logit,
-                block.raw_mode_logit,
-            ]
+        # Alive/death optimization is allowed immediately.
+        alive_gate_parameters.append(
+            block.raw_alive_logit
+        )
+
+        # Surface/volume selection is delayed.
+        mode_gate_parameters.append(
+            block.raw_mode_logit
         )
 
         if (
             optimize_sh
             and block.raw_local_sh_delta.requires_grad
         ):
-            local_sh_parameters.append(block.raw_local_sh_delta)
+            local_sh_parameters.append(
+                block.raw_local_sh_delta
+            )
 
     groups = [
         {
@@ -460,10 +480,18 @@ def make_optimizer(voxel_scene, optimize_sh):
             "lr": MATERIAL_LR,
         },
         {
-            "params": gate_parameters,
-            "lr": GATE_LR,
+            "params": alive_gate_parameters,
+            "lr": ALIVE_GATE_LR,
         },
     ]
+
+    if optimize_mode:
+        groups.append(
+            {
+                "params": mode_gate_parameters,
+                "lr": MODE_LR,
+            }
+        )
 
     if optimize_sh and local_sh_parameters:
         groups.append(
@@ -790,6 +818,189 @@ def save_checkpoint(
         },
         path,
     )
+    
+    
+def rebuild_fixed_voxel_scene_from_checkpoint(
+    checkpoint_data,
+    device,
+    optimize_sh,
+):
+    """
+    Rebuild FixedVoxelScene topology from a saved checkpoint, then load
+    all exact learned parameters/buffers from scene_state.
+
+    This supports checkpoints saved after:
+        - splitting;
+        - neighbor activation;
+        - hard pruning.
+    """
+    required_keys = {
+        "scene_state",
+        "block_specs",
+        "root_voxel_size",
+    }
+
+    missing = required_keys - set(checkpoint_data.keys())
+
+    if missing:
+        raise KeyError(
+            "Fixed voxel checkpoint is missing required keys: "
+            f"{sorted(missing)}"
+        )
+
+    scene_state = checkpoint_data["scene_state"]
+    block_specs = checkpoint_data["block_specs"]
+
+    blocks = []
+
+    for block_index, spec in enumerate(block_specs):
+        level = int(spec["level"])
+        grid_index = tuple(
+            int(value)
+            for value in spec["grid_index"]
+        )
+
+        # ModuleDict name must match fixed_voxel_scene.py naming.
+        #
+        # The scene_state keys look like:
+        #   blocks.L0_X1_Y2_Z3.initial_ctrl
+        #
+        # Rather than duplicating naming logic manually, build the logical
+        # key first, then use the scene's naming convention below.
+        from fixed_voxel_scene import module_name_from_key, voxel_key
+
+        logical_key = voxel_key(
+            level,
+            grid_index,
+        )
+
+        module_name = module_name_from_key(logical_key)
+        prefix = f"blocks.{module_name}."
+
+        # These initial buffers are sufficient to construct the block.
+        # load_state_dict() below restores current raw learned parameters.
+        required_block_state = [
+            "center",
+            "world_size",
+            "initial_ctrl",
+            "initial_sigma",
+            "initial_base_color_r",
+            "initial_base_color_g",
+            "initial_base_color_b",
+            "initial_opacity",
+            "initial_roughness",
+            "initial_sh",
+            "metallic_value",
+            "specular_value",
+        ]
+
+        absent = [
+            name
+            for name in required_block_state
+            if prefix + name not in scene_state
+        ]
+
+        if absent:
+            raise KeyError(
+                f"Checkpoint block {logical_key} is missing state keys:\n"
+                f"{absent}"
+            )
+
+        center = scene_state[prefix + "center"]
+        world_size = float(
+            scene_state[prefix + "world_size"]
+        )
+
+        parent_key = spec.get("parent_key", None)
+
+        if parent_key is not None:
+            parent_key = tuple(
+                int(value)
+                for value in parent_key
+            )
+
+        block = FixedVoxelBlock(
+            center=center,
+            world_size=world_size,
+            ctrl_values=scene_state[prefix + "initial_ctrl"],
+            sigma=float(
+                scene_state[prefix + "initial_sigma"]
+            ),
+            base_color_r=float(
+                scene_state[prefix + "initial_base_color_r"]
+            ),
+            base_color_g=float(
+                scene_state[prefix + "initial_base_color_g"]
+            ),
+            base_color_b=float(
+                scene_state[prefix + "initial_base_color_b"]
+            ),
+            opacity=float(
+                scene_state[prefix + "initial_opacity"]
+            ),
+            roughness=float(
+                scene_state[prefix + "initial_roughness"]
+            ),
+            sh_values=scene_state[prefix + "initial_sh"],
+            metallic=float(
+                scene_state[prefix + "metallic_value"]
+            ),
+            specular=float(
+                scene_state[prefix + "specular_value"]
+            ),
+            level=level,
+            grid_index=grid_index,
+            parent_key=parent_key,
+            # These are overwritten by scene_state if present.
+            initial_alive_probability=0.99,
+            initial_volume_probability=0.5,
+            optimize_environment=bool(optimize_sh),
+        ).to(device)
+
+        blocks.append(block)
+
+    # Retrieve original global SH from checkpoint state if possible.
+    global_sh_key = "lighting.initial_global_sh"
+
+    if global_sh_key not in scene_state:
+        raise KeyError(
+            f"Checkpoint missing required key: {global_sh_key}"
+        )
+
+    voxel_scene = FixedVoxelScene(
+        blocks=blocks,
+        initial_global_sh=scene_state[global_sh_key],
+        optimize_sh=bool(optimize_sh),
+        global_sh_bound=float(
+            checkpoint_data.get(
+                "metadata",
+                {},
+            ).get(
+                "global_sh_bound",
+                GLOBAL_SH_BOUND,
+            )
+        ),
+        root_voxel_size=float(
+            checkpoint_data["root_voxel_size"]
+        ),
+    ).to(device)
+
+    missing_keys, unexpected_keys = voxel_scene.load_state_dict(
+        scene_state,
+        strict=False,
+    )
+
+    if missing_keys:
+        print("[RESUME] Missing scene keys:")
+        for key in missing_keys:
+            print("  ", key)
+
+    if unexpected_keys:
+        print("[RESUME] Unexpected scene keys:")
+        for key in unexpected_keys:
+            print("  ", key)
+
+    return voxel_scene
 
 
 # ============================================================
@@ -1115,6 +1326,27 @@ def main():
             "Try octree splitting every N iterations. Use 0 to disable."
         ),
     )
+    
+    parser.add_argument(
+        "--camera_depth_sign",
+        type=float,
+        default=1.0,
+        help=(
+            "Depth sign for fixed-voxel far-to-near compositing. "
+            "Use +1 when farther blocks have larger camera-space depth; "
+            "use -1 when farther blocks have more negative camera-space depth."
+        ),
+    )
+    
+    parser.add_argument(
+        "--resume_checkpoint",
+        type=Path,
+        default=None,
+        help=(
+            "Resume fixed voxel scene from a saved checkpoint. "
+            "The block topology and learned parameters are restored."
+        ),
+    )
 
     args = parser.parse_args()
     
@@ -1211,6 +1443,7 @@ def main():
         use_fno_activation_checkpointing=(
             not args.disable_fno_activation_checkpointing
         ),
+        camera_depth_sign=args.camera_depth_sign,
     ).to(device)
 
     # --------------------------------------------------------
@@ -1261,105 +1494,168 @@ def main():
     # --------------------------------------------------------
     # Fixed voxel initialization.
     # --------------------------------------------------------
-
-    sh_bank = build_sh_bank(device)
-
-    initial_env_id = int(
-        rng.integers(0, NUM_GLOBAL_ENVS)
-    )
-
-    initial_global_sh = sh_bank[initial_env_id].detach().clone()
-
-    max_chunks = (
-        None
-        if args.max_initial_blocks <= 0
-        else int(args.max_initial_blocks)
-    )
-
-    seeds = voxel_chunk_seeds(
-        xyz=point_xyz,
-        colors=point_colors,
-        voxel_size=args.voxel_size,
-        min_points=args.min_points_per_voxel,
-        max_chunks=max_chunks,
-    )
-
-    if not seeds:
-        raise RuntimeError(
-            "No valid voxel seeds. Increase --voxel_size or lower "
-            "--min_points_per_voxel."
-        )
-
-    # Important fixed-grid convention:
-    #
-    # voxel_chunk_seeds() returns median point locations. For a true fixed
-    # hierarchy, root block centers must lie exactly at grid-cell centers.
-    #
-    # We convert each seed's median back to its floor-grid index, then use:
-    #
-    #     center = (index + 0.5) * voxel_size
-    #
-    # This ensures child splits and same-level neighbors align correctly.
-    aligned_seeds = []
-
-    for seed in seeds:
-        grid_index = root_grid_index_from_center(
-            center=seed["center"],
-            root_voxel_size=args.voxel_size,
-        )
-
-        aligned_center = (
-            torch.tensor(
-                grid_index,
-                dtype=torch.float32,
-                device=seed["center"].device,
+    
+    
+    # --------------------------------------------------------
+    # Fixed voxel initialization or resume.
+    # --------------------------------------------------------
+    
+    checkpoint_data = None
+    start_iteration = 0
+    initial_env_id = -1
+    
+    if args.resume_checkpoint is not None:
+        if not args.resume_checkpoint.is_file():
+            raise FileNotFoundError(
+                f"Resume checkpoint not found:\n"
+                f"  {args.resume_checkpoint}"
             )
-            + 0.5
-        ) * float(args.voxel_size)
-
-        aligned_seed = dict(seed)
-        aligned_seed["center"] = aligned_center
-        aligned_seeds.append(aligned_seed)
-
-    def init_parameter_fn(seed):
-        return make_block_initialization(
-            rng=rng,
-            initial_global_sh=initial_global_sh,
-            seed=seed,
+    
+        print("Resuming from:", args.resume_checkpoint)
+    
+        checkpoint_data = torch.load(
+            args.resume_checkpoint,
+            map_location=device,
+            weights_only=False,
         )
-
-    blocks = make_blocks_from_voxel_seeds(
-        seeds=aligned_seeds,
-        root_voxel_size=args.voxel_size,
-        init_parameter_fn=init_parameter_fn,
-        initial_global_sh=initial_global_sh,
-        device=device,
-        optimize_environment=args.optimize_sh,
-        initial_volume_probability=args.initial_volume_probability,
-        initial_alive_probability=args.initial_alive_probability,
-    )
-
-    voxel_scene = FixedVoxelScene(
-        blocks=blocks,
-        initial_global_sh=initial_global_sh,
-        optimize_sh=args.optimize_sh,
-        global_sh_bound=GLOBAL_SH_BOUND,
-        root_voxel_size=args.voxel_size,
-    ).to(device)
-
-    print(
-        f"Initialized fixed voxel scene with {len(voxel_scene)} blocks."
-    )
+    
+        optimize_sh_from_checkpoint = bool(
+            checkpoint_data.get(
+                "metadata",
+                {},
+            ).get(
+                "optimize_sh",
+                False,
+            )
+        )
+    
+        if optimize_sh_from_checkpoint != bool(args.optimize_sh):
+            print(
+                "[WARN] Resume checkpoint optimize_sh="
+                f"{optimize_sh_from_checkpoint}, "
+                f"current --optimize_sh={args.optimize_sh}."
+            )
+    
+        voxel_scene = rebuild_fixed_voxel_scene_from_checkpoint(
+            checkpoint_data=checkpoint_data,
+            device=device,
+            optimize_sh=args.optimize_sh,
+        )
+    
+        start_iteration = int(checkpoint_data["iteration"]) + 1
+    
+        initial_env_id = int(
+            checkpoint_data.get(
+                "metadata",
+                {},
+            ).get(
+                "initial_env_id",
+                -1,
+            )
+        )
+    
+        print(
+            f"Resumed fixed voxel scene at iteration={start_iteration}, "
+            f"blocks={len(voxel_scene)}"
+        )
+        
+        start_iteration = int(checkpoint_data["iteration"]) + 1
+    
+    else:
+        sh_bank = build_sh_bank(device)
+    
+        initial_env_id = int(
+            rng.integers(0, NUM_GLOBAL_ENVS)
+        )
+    
+        initial_global_sh = sh_bank[
+            initial_env_id
+        ].detach().clone()
+    
+        max_chunks = (
+            None
+            if args.max_initial_blocks <= 0
+            else int(args.max_initial_blocks)
+        )
+    
+        seeds = voxel_chunk_seeds(
+            xyz=point_xyz,
+            colors=point_colors,
+            voxel_size=args.voxel_size,
+            min_points=args.min_points_per_voxel,
+            max_chunks=max_chunks,
+        )
+    
+        if not seeds:
+            raise RuntimeError(
+                "No valid voxel seeds. Increase --voxel_size or lower "
+                "--min_points_per_voxel."
+            )
+    
+        aligned_seeds = []
+    
+        for seed in seeds:
+            grid_index = root_grid_index_from_center(
+                center=seed["center"],
+                root_voxel_size=args.voxel_size,
+            )
+    
+            aligned_center = (
+                torch.tensor(
+                    grid_index,
+                    dtype=torch.float32,
+                    device=seed["center"].device,
+                )
+                + 0.5
+            ) * float(args.voxel_size)
+    
+            aligned_seed = dict(seed)
+            aligned_seed["center"] = aligned_center
+            aligned_seeds.append(aligned_seed)
+    
+        def init_parameter_fn(seed):
+            return make_block_initialization(
+                rng=rng,
+                initial_global_sh=initial_global_sh,
+                seed=seed,
+            )
+    
+        blocks = make_blocks_from_voxel_seeds(
+            seeds=aligned_seeds,
+            root_voxel_size=args.voxel_size,
+            init_parameter_fn=init_parameter_fn,
+            initial_global_sh=initial_global_sh,
+            device=device,
+            optimize_environment=args.optimize_sh,
+            initial_volume_probability=args.initial_volume_probability,
+            initial_alive_probability=args.initial_alive_probability,
+        )
+    
+        voxel_scene = FixedVoxelScene(
+            blocks=blocks,
+            initial_global_sh=initial_global_sh,
+            optimize_sh=args.optimize_sh,
+            global_sh_bound=GLOBAL_SH_BOUND,
+            root_voxel_size=args.voxel_size,
+        ).to(device)
+    
+        print(
+            f"Initialized fixed voxel scene with {len(voxel_scene)} blocks."
+        )
 
     # --------------------------------------------------------
     # Optimizer.
     # --------------------------------------------------------
 
+    # Keep surface/volume gates fixed initially so lighting/material response
+    # can establish itself before blocks choose volume as an easy solution.
+    optimize_mode = False
+    
     optimizer = make_optimizer(
         voxel_scene=voxel_scene,
         optimize_sh=args.optimize_sh,
+        optimize_mode=optimize_mode,
     )
-    
     gradient_stats = make_voxel_gradient_stats(voxel_scene)
     
     dead_streaks = {}
@@ -1385,7 +1681,25 @@ def main():
     # Optimization.
     # --------------------------------------------------------
 
-    for iteration in range(args.iterations):
+    for iteration in range(start_iteration, args.iterations):
+        should_optimize_mode = (
+            iteration >= MODE_START_ITERS
+        )
+
+        if should_optimize_mode != optimize_mode:
+            optimize_mode = should_optimize_mode
+
+            optimizer = make_optimizer(
+                voxel_scene=voxel_scene,
+                optimize_sh=args.optimize_sh,
+                optimize_mode=optimize_mode,
+            )
+
+            print(
+                f"[MODE SCHEDULE] iteration={iteration}: "
+                f"optimize_mode={optimize_mode}"
+            )
+            
         optimizer.zero_grad(set_to_none=True)
 
         cameras_per_step = min(
@@ -1549,6 +1863,21 @@ def main():
                 f"blocks={summary['num_blocks']} "
                 f"mean_alive={summary['mean_alive']:.4f} "
                 f"mean_volume={summary['mean_volume_weight']:.4f}"
+            )
+            
+            volume_weights = torch.stack(
+                [
+                    block.volume_weight.detach()
+                    for block in voxel_scene.blocks.values()
+                ]
+            )
+
+            print(
+                "  mode state: "
+                f"enabled={optimize_mode} "
+                f"volume_mean={volume_weights.mean().item():.4f} "
+                f"volume_min={volume_weights.min().item():.4f} "
+                f"volume_max={volume_weights.max().item():.4f}"
             )
             
         # --------------------------------------------------------
@@ -1807,6 +2136,7 @@ def main():
                 optimizer = make_optimizer(
                     voxel_scene=voxel_scene,
                     optimize_sh=args.optimize_sh,
+                    optimize_mode=optimize_mode,
                 )
         
                 print(
