@@ -112,9 +112,9 @@ SHAPE_WARMUP_ITERS = 500
 LIGHTING_START_ITERS = 1000
 
 # Early stage: shape/material adapt fast.
-EARLY_PLACEMENT_LR = 1e-4
-EARLY_SHAPE_LR = 5e-3
-EARLY_MATERIAL_LR = 7e-3
+EARLY_PLACEMENT_LR = 1e-3
+EARLY_SHAPE_LR = 5e-2
+EARLY_MATERIAL_LR = 7e-2
 
 # Middle stage: stabilize geometry.
 MID_PLACEMENT_LR = 5e-4

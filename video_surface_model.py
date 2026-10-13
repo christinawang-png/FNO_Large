@@ -27,9 +27,9 @@ IMG_META_CSV = RENDERS_DIR / "metadata_images_all_sharded.csv"
 VOL_META_CSV = BASE_DIR / "metadata_volumes.csv"
 ALPHA_META_CSV = ALPHA_DIR / "metadata_alpha_all.csv"
 
-CHECKPOINT_PATH = Path("fno_premult_surface_final.pt")
+CHECKPOINT_PATH = Path("fno_premult_surface_epoch128_color.pt")
 
-OUTPUT_DIR = BASE_DIR / "surface_videos"
+OUTPUT_DIR = Path("surface_videos")
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 OUTPUT_VIDEO = OUTPUT_DIR / "surface_interpolation.mp4"
@@ -43,7 +43,7 @@ FPS = 30
 # Select two surface examples as interpolation endpoints.
 # These are positions among the surface-only rows, not sample IDs.
 START_SURFACE_INDEX = 0
-END_SURFACE_INDEX = 8600
+END_SURFACE_INDEX = 8610
 
 # If True, the animation goes start -> end -> start smoothly.
 LOOP_BACK = True
@@ -102,8 +102,9 @@ def row_to_state(dataset, row, sh_cols):
         },
         "sigma": float(shape_info["sigma"]),
 
-        "hue": float(row["hue"]),
-        "saturation": float(row["saturation"]),
+        "base_color_r": float(row["base_color_r"]),
+        "base_color_g": float(row["base_color_g"]),
+        "base_color_b": float(row["base_color_b"]),
         "metallic": float(row["metallic"]),
         "roughness": float(row["roughness"]),
         "opacity": float(row["opacity"]),
@@ -142,14 +143,18 @@ def interpolate_states(a, b, u, ctrl_cols, sh_cols):
     out["sigma"] = (1.0 - u) * a["sigma"] + u * b["sigma"]
 
     # Hue is cyclic in [0, 1].
-    out["hue"] = interpolate_periodic(
-        a["hue"], b["hue"], u, period=1.0
+    out["base_color_r"] = interpolate_periodic(
+        a["base_color_r"], b["base_color_r"], u, period=1.0
+    )
+    
+    out["base_color_g"] = interpolate_periodic(
+        a["base_color_g"], b["base_color_g"], u, period=1.0
+    )
+    
+    out["base_color_b"] = interpolate_periodic(
+        a["base_color_b"], b["base_color_b"], u, period=1.0
     )
 
-    out["saturation"] = (
-        (1.0 - u) * a["saturation"]
-        + u * b["saturation"]
-    )
     out["metallic"] = (
         (1.0 - u) * a["metallic"]
         + u * b["metallic"]
@@ -212,8 +217,9 @@ def state_to_normalized_vector(
 
     # Surface material parameters.
     scalars.extend([
-        state["hue"],
-        state["saturation"],
+        state["base_color_r"],
+        state["base_color_g"],
+        state["base_color_b"],
         state["metallic"],
         state["roughness"],
         state["opacity"],
