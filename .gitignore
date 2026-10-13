@@ -21,3 +21,5 @@
 
 # Ignore job output files directly under gaussian_splatting_copy
 /gaussian_splatting_copy/*.out
+
+/gaussian_splatting_copy/fixed_voxel_static_128_splitting_prunning_neighbor_hotdog/
