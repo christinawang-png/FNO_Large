@@ -1,0 +1,17 @@
+{
+  "scene_checkpoint": "fixed_voxel_static_128_splitting_prunning_neighbor_hotdog/checkpoint_iter_000705.pt",
+  "surface_checkpoint": "/orcd/home/002/yuanxiuw/FNO_Large/checkpoints_implicit_modes16_l1/surface/best.pt",
+  "volume_checkpoint": "/orcd/home/002/yuanxiuw/FNO_Large/checkpoints_implicit_modes16_l1/volume/best.pt",
+  "num_cameras": 400,
+  "mean_l1": 0.02932847009971738,
+  "mean_mse": 0.00576721980876755,
+  "mean_psnr": 22.627863392829894,
+  "mean_ssim": 0.82143131300807,
+  "mean_mixed_loss": 0.04975201440043747,
+  "median_psnr": 22.52695369720459,
+  "median_ssim": 0.8293895721435547,
+  "camera_depth_sign": 1.0,
+  "flip_projection_y": true,
+  "flip_fno_vertical": false,
+  "use_tile_renderer": true
+}

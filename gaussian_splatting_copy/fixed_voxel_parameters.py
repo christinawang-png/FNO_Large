@@ -543,6 +543,7 @@ class FixedVoxelBlock(nn.Module):
         self,
         shared_sh=None,
         alive_weight=1e-4,
+        alive_entropy_weight=0.0,
         mode_entropy_weight=0.0,
     ):
         """
@@ -604,6 +605,28 @@ class FixedVoxelBlock(nn.Module):
         # Weak sparsity pressure. The image reconstruction loss decides
         # whether blocks remain needed.
         loss = loss + float(alive_weight) * self.alive_weight
+        
+        # Encourage the alive gate toward a binary decision:
+        #
+        # alive_weight -> 0  (dead)
+        # alive_weight -> 1  (alive)
+        #
+        # Do not use a large value; otherwise it may force premature death.
+        if alive_entropy_weight > 0.0:
+            alive_probability = self.alive_weight.clamp(
+                1e-6,
+                1.0 - 1e-6,
+            )
+
+            alive_entropy = -(
+                alive_probability * torch.log(alive_probability)
+                + (1.0 - alive_probability)
+                * torch.log(1.0 - alive_probability)
+            )
+
+            loss = loss + (
+                float(alive_entropy_weight) * alive_entropy
+            )
 
         if mode_entropy_weight > 0.0:
             p_volume = self.volume_weight.clamp(1e-6, 1.0 - 1e-6)

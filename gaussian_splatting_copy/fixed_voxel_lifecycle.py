@@ -57,6 +57,10 @@ def make_voxel_gradient_stats(voxel_scene):
             key: 0.0
             for key, _ in voxel_scene.iter_blocks_with_keys()
         },
+        "alive_grad_signed": {
+            key: 0.0
+            for key, _ in voxel_scene.iter_blocks_with_keys()
+        },
     }
 
 
@@ -105,6 +109,13 @@ def accumulate_voxel_gradient_stats(voxel_scene, stats):
 
         alive_norm = _grad_norm(block.raw_alive_logit)
         mode_norm = _grad_norm(block.raw_mode_logit)
+        
+        if block.raw_alive_logit.grad is None:
+            alive_signed = 0.0
+        else:
+            alive_signed = float(
+                block.raw_alive_logit.grad.detach().item()
+            )
 
         # A combined score useful for general diagnostics.
         block_norm = (
@@ -119,6 +130,7 @@ def accumulate_voxel_gradient_stats(voxel_scene, stats):
         stats["alive_grad_norm"][key] += alive_norm
         stats["mode_grad_norm"][key] += mode_norm
         stats["block_grad_norm"][key] += block_norm
+        stats["alive_grad_signed"][key] += alive_signed
 
 
 def finalize_voxel_gradient_stats(stats):
@@ -134,6 +146,7 @@ def finalize_voxel_gradient_stats(stats):
         "shape_grad_norm",
         "appearance_grad_norm",
         "alive_grad_norm",
+        "alive_grad_signed",
         "mode_grad_norm",
     ]:
         output[stat_name] = {
@@ -442,17 +455,64 @@ def choose_neighbor_activation_candidates(
     max_candidates=8,
     min_alive_weight=0.50,
     min_gradient=0.0,
+    alive_growth_score_weight=2.0,
 ):
     """
-    Rank active blocks that may be worth expanding into empty neighboring
-    cells.
+    Rank source blocks for fixed-grid neighbor activation.
 
-    This is intentionally cheap: no additional rendering is performed.
+    Growth is favored for blocks whose signed alive-logit gradient indicates
+    that gradient descent wants the block to become MORE alive.
 
-    Score:
-        (shape_grad + appearance_grad + mode_grad)
-        * alive_weight
-        * opacity
+    Gradient descent update:
+
+        raw_alive_logit -= learning_rate * gradient
+
+    Therefore:
+
+        gradient < 0:
+            optimizer increases raw_alive_logit
+            -> alive_weight increases
+            -> useful growth signal
+
+        gradient > 0:
+            optimizer decreases raw_alive_logit
+            -> alive_weight decreases
+            -> likely excessive / dying block
+            -> receives no alive-growth bonus
+
+    Positive alive gradients are not hard-excluded, because a block may still
+    have strong shape/appearance pressure. They simply rank lower than
+    otherwise comparable blocks with negative alive gradients.
+
+    Parameters
+    ----------
+    lifecycle_stats:
+        Output from collect_voxel_lifecycle_stats().
+
+    gradient_summary:
+        Output from finalize_voxel_gradient_stats(). Must contain:
+
+            shape_grad_norm
+            appearance_grad_norm
+            mode_grad_norm
+            alive_grad_signed
+
+    max_candidates:
+        Maximum source-block keys returned.
+
+    min_alive_weight:
+        Ignore mostly dead blocks as sources.
+
+    min_gradient:
+        Minimum non-alive gradient score required for consideration.
+
+    alive_growth_score_weight:
+        Strength of bonus given to negative signed alive gradients.
+
+    Returns
+    -------
+    list
+        Ranked voxel keys, strongest first.
     """
     stats_by_key = {
         row["key"]: row
@@ -471,36 +531,84 @@ def choose_neighbor_activation_candidates(
         shape_grad = float(
             gradient_summary["shape_grad_norm"].get(key, 0.0)
         )
+
         appearance_grad = float(
             gradient_summary["appearance_grad_norm"].get(key, 0.0)
         )
+
         mode_grad = float(
             gradient_summary["mode_grad_norm"].get(key, 0.0)
         )
 
-        total_gradient = (
+        alive_grad_signed = float(
+            gradient_summary["alive_grad_signed"].get(key, 0.0)
+        )
+
+        # Only negative alive gradients signal that gradient descent wants
+        # to increase block existence. Positive gradients get no bonus.
+        alive_growth_preference = max(
+            0.0,
+            -alive_grad_signed,
+        )
+
+        non_alive_gradient = (
             shape_grad
             + appearance_grad
             + mode_grad
         )
 
-        if total_gradient < float(min_gradient):
+        if non_alive_gradient < float(min_gradient):
             continue
 
-        score = (
-            total_gradient
-            * alive_weight
-            * max(opacity, 1e-6)
-        )
+        # Avoid opacity becoming a complete veto for faint but useful areas.
+        # A low-opacity block gets downweighted, but still remains eligible.
+        opacity_factor = max(opacity, 0.2)
 
-        scored.append((score, key))
+        score = (
+            non_alive_gradient
+            + float(alive_growth_score_weight)
+            * alive_growth_preference
+        ) * alive_weight * opacity_factor
+
+        scored.append(
+            (
+                score,
+                key,
+                {
+                    "shape_grad": shape_grad,
+                    "appearance_grad": appearance_grad,
+                    "mode_grad": mode_grad,
+                    "alive_grad_signed": alive_grad_signed,
+                    "alive_growth_preference": alive_growth_preference,
+                    "alive_weight": alive_weight,
+                    "opacity": opacity,
+                },
+            )
+        )
 
     scored.sort(
         key=lambda item: item[0],
         reverse=True,
     )
 
+    print("[NEIGHBOR GROW CANDIDATES]")
+
+    for rank, (score, key, info) in enumerate(
+        scored[:min(int(max_candidates), 8)]
+    ):
+        print(
+            f"  rank={rank:02d} "
+            f"key={key} "
+            f"score={score:.4e} "
+            f"alive={info['alive_weight']:.3f} "
+            f"opacity={info['opacity']:.3f} "
+            f"shape_grad={info['shape_grad']:.3e} "
+            f"appearance_grad={info['appearance_grad']:.3e} "
+            f"mode_grad={info['mode_grad']:.3e} "
+            f"alive_grad_signed={info['alive_grad_signed']:+.3e}"
+        )
+
     return [
         key
-        for _, key in scored[:int(max_candidates)]
+        for _, key, _ in scored[:int(max_candidates)]
     ]

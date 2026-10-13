@@ -132,7 +132,7 @@ MODE_START_ITERS = 1200
 # Lighting begins immediately when --optimize_sh is used.
 # These are intentionally visible/debuggable values.
 LOCAL_SH_LR = 1e-3
-GLOBAL_SH_LR = 1e-2
+GLOBAL_SH_LR = 2e-2
 
 MAX_GRAD_NORM = 1.0
 
@@ -143,6 +143,8 @@ MODE_ENTROPY_WEIGHT = 0.0
 
 GLOBAL_SH_BOUND = 0.05
 GLOBAL_SH_REG_WEIGHT = 1e-2
+
+ALIVE_ENTROPY_WEIGHT = 1e-4
 
 
 # ============================================================
@@ -622,6 +624,7 @@ def regularization_loss(
         total = total + PARAMETER_REG_WEIGHT * block.regularization_loss(
             shared_sh=voxel_scene.global_sh,
             alive_weight=alive_weight,
+            alive_entropy_weight=ALIVE_ENTROPY_WEIGHT,
             mode_entropy_weight=mode_entropy_weight,
         )
 
@@ -1001,6 +1004,46 @@ def rebuild_fixed_voxel_scene_from_checkpoint(
             print("  ", key)
 
     return voxel_scene
+    
+
+@torch.no_grad()
+def perturb_middle_alive_logits(
+    voxel_scene,
+    low=0.2,
+    high=0.8,
+    noise_std=0.75,
+):
+    """
+    Perturb ambiguous alive gates to help escape a local minimum.
+
+    Only blocks whose alive weight is between low and high are changed.
+    Very alive blocks and nearly dead blocks are preserved.
+    """
+    changed = 0
+
+    for key, block in voxel_scene.iter_blocks_with_keys():
+        alive = float(block.alive_weight.detach().cpu())
+
+        if low < alive < high:
+            noise = noise_std * torch.randn_like(
+                block.raw_alive_logit
+            )
+
+            block.raw_alive_logit.add_(noise)
+            changed += 1
+
+            print(
+                f"[ALIVE RESET] key={key} "
+                f"alive_before={alive:.3f} "
+                f"logit_noise={float(noise):+.3f}"
+            )
+
+    print(
+        f"[ALIVE RESET] Perturbed {changed} ambiguous "
+        f"alive logits."
+    )
+
+    return changed
 
 
 # ============================================================
@@ -1037,7 +1080,7 @@ def main():
     parser.add_argument(
         "--initial_volume_probability",
         type=float,
-        default=0.5,
+        default=0,
         help=(
             "Initial soft volume probability for every block. "
             "0 = surface, 1 = volume, 0.5 = neutral."
@@ -1347,6 +1390,46 @@ def main():
             "The block topology and learned parameters are restored."
         ),
     )
+    
+    parser.add_argument(
+        "--perturb_middle_alive",
+        action="store_true",
+        help=(
+            "After loading/initializing a scene, perturb alive logits for "
+            "blocks with ambiguous middle alive weights."
+        ),
+    )
+    
+    parser.add_argument(
+        "--alive_reset_low",
+        type=float,
+        default=0.2,
+    )
+    
+    parser.add_argument(
+        "--alive_reset_high",
+        type=float,
+        default=0.8,
+    )
+    
+    parser.add_argument(
+        "--alive_reset_noise_std",
+        type=float,
+        default=0.75,
+        help=(
+            "Standard deviation of raw alive-logit noise for ambiguous blocks."
+        ),
+    )
+    
+    parser.add_argument(
+        "--max_neighbors_per_source",
+        type=int,
+        default=2,
+        help=(
+            "Maximum number of empty face-neighbor blocks activated from "
+            "one source block during one neighbor-growth update."
+        ),
+    )
 
     args = parser.parse_args()
     
@@ -1490,11 +1573,6 @@ def main():
 
     point_xyz = gaussian_model.get_xyz.detach()
     point_colors = try_get_point_colors(gaussian_model)
-
-    # --------------------------------------------------------
-    # Fixed voxel initialization.
-    # --------------------------------------------------------
-    
     
     # --------------------------------------------------------
     # Fixed voxel initialization or resume.
@@ -1641,6 +1719,14 @@ def main():
     
         print(
             f"Initialized fixed voxel scene with {len(voxel_scene)} blocks."
+        )
+        
+    if args.perturb_middle_alive:
+        perturb_middle_alive_logits(
+            voxel_scene=voxel_scene,
+            low=args.alive_reset_low,
+            high=args.alive_reset_high,
+            noise_std=args.alive_reset_noise_std,
         )
 
     # --------------------------------------------------------
@@ -2000,30 +2086,60 @@ def main():
                         continue
         
                     # Pick one available face-neighbor without directional bias.
-                    target_key = available_neighbors[
-                        int(rng.integers(0, len(available_neighbors)))
-                    ]
-        
-                    try:
-                        created_key, _ = activate_neighbor_from_source(
-                            scene=voxel_scene,
-                            source_key=source_key,
-                            neighbor_grid_index=target_key[1:],
-                        )
-        
-                        print(
-                            "[NEIGHBOR ACTIVATE] "
-                            f"source={source_key} -> target={created_key}"
-                        )
-        
-                        activated_count += 1
-                        topology_changed = True
-        
-                    except Exception as exc:
-                        print(
-                            "[WARN] Neighbor activation failed for "
-                            f"source={source_key}: {exc}"
-                        )
+                    # Randomize available face directions. One source can activate more
+                    # than one neighboring voxel, but total growth remains globally capped.
+                    neighbor_order = rng.permutation(len(available_neighbors))
+                    
+                    neighbors_activated_from_source = 0
+                    
+                    for neighbor_local_index in neighbor_order:
+                        if (
+                            activated_count
+                            >= args.max_neighbor_activations_per_update
+                        ):
+                            break
+                    
+                        if (
+                            neighbors_activated_from_source
+                            >= args.max_neighbors_per_source
+                        ):
+                            break
+                    
+                        if (
+                            max_blocks is not None
+                            and len(voxel_scene) >= max_blocks
+                        ):
+                            print(
+                                "[NEIGHBOR ACTIVATE] Reached max_blocks="
+                                f"{max_blocks}; stopping activation."
+                            )
+                            break
+                    
+                        target_key = available_neighbors[
+                            int(neighbor_local_index)
+                        ]
+                    
+                        try:
+                            created_key, _ = activate_neighbor_from_source(
+                                scene=voxel_scene,
+                                source_key=source_key,
+                                neighbor_grid_index=target_key[1:],
+                            )
+                    
+                            print(
+                                "[NEIGHBOR ACTIVATE] "
+                                f"source={source_key} -> target={created_key}"
+                            )
+                    
+                            activated_count += 1
+                            neighbors_activated_from_source += 1
+                            topology_changed = True
+                    
+                        except Exception as exc:
+                            print(
+                                f"[WARN] Neighbor activation failed for "
+                                f"source={source_key}: {exc}"
+                            )
         
             # ====================================================
             # 2. Hard pruning: only if activation changed nothing

@@ -181,7 +181,7 @@ def rebuild_fixed_voxel_scene_from_checkpoint(
             {},
         ).get(
             "global_sh_bound",
-            0.005,
+            0.05,
         )
     )
 
