@@ -26,6 +26,8 @@ import random
 import sys
 from argparse import ArgumentParser
 from pathlib import Path
+import types
+import pathlib
 
 import imageio.v2 as imageio
 import numpy as np
@@ -145,6 +147,20 @@ GLOBAL_SH_BOUND = 0.05
 GLOBAL_SH_REG_WEIGHT = 1e-2
 
 ALIVE_ENTROPY_WEIGHT = 1e-4
+
+
+# Some checkpoints saved under Python 3.13 pickle Path objects using
+# pathlib._local. Python 3.10 does not contain that module.
+#
+# Create a compatibility alias before torch.load() unpickles checkpoint data.
+if "pathlib._local" not in sys.modules:
+    pathlib_local_compat = types.ModuleType("pathlib._local")
+
+    pathlib_local_compat.Path = pathlib.Path
+    pathlib_local_compat.PosixPath = pathlib.PosixPath
+    pathlib_local_compat.WindowsPath = pathlib.WindowsPath
+
+    sys.modules["pathlib._local"] = pathlib_local_compat
 
 
 # ============================================================
