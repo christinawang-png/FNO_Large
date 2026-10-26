@@ -1446,6 +1446,26 @@ def main():
             "one source block during one neighbor-growth update."
         ),
     )
+    
+    parser.add_argument(
+        "--gaussian_model_path",
+        type=Path,
+        required=True,
+        help=(
+            "Directory produced by the completed 3DGS training run. "
+            "Expected to contain point_cloud/iteration_XXXXXX/point_cloud.ply."
+        ),
+    )
+    
+    parser.add_argument(
+        "--gaussian_iteration",
+        type=int,
+        default=-1,
+        help=(
+            "3DGS iteration to load. Use -1 to load the latest saved "
+            "point-cloud iteration."
+        ),
+    )
 
     args = parser.parse_args()
     
@@ -1550,24 +1570,34 @@ def main():
     # --------------------------------------------------------
 
     scene_args = lp.extract(args)
-
-    if not scene_args.model_path:
-        scene_args.model_path = str(
-            REPO_DIR / "output" / "fixed_voxel_scene"
+    
+    # `source_path` still comes from the normal 3DGS ModelParams arguments
+    # and identifies the COLMAP/image dataset.
+    #
+    # `model_path` must instead point to the output of the already completed
+    # 3DGS training run, because Scene(..., load_iteration=...) loads the
+    # trained Gaussian point cloud from that directory.
+    scene_args.model_path = str(args.gaussian_model_path.resolve())
+    
+    if not Path(scene_args.model_path).is_dir():
+        raise FileNotFoundError(
+            "3DGS model directory does not exist:\n"
+            f"  {scene_args.model_path}"
         )
-
-    Path(scene_args.model_path).mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
+    
     gaussian_model = GaussianModel(args.sh_degree)
-
+    
     scene = Scene(
         scene_args,
         gaussian_model,
+        load_iteration=args.gaussian_iteration,
         shuffle=False,
         resolution_scales=[1.0],
+    )
+    
+    print(
+        "Loaded trained 3DGS Gaussians from "
+        f"iteration {scene.loaded_iter}."
     )
 
     all_cameras = scene.getTrainCameras(scale=1.0)

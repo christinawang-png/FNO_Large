@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=neural_renderer_test
+#SBATCH --job-name=neural_renderer_test_3dgs
 #SBATCH --nodes=1
 #SBATCH --partition=gpu,seas_gpu
 #SBATCH --cpus-per-task=1
@@ -27,16 +27,18 @@ nvidia-smi
 python optimize_fixed_voxel_scene.py \
     --source_path /n/holylfs05/LABS/pfister_lab/Lab/coxfs01/pfister_lab2/Lab/yuanxiuwang/nerf_synthetic_processed/hotdog_black \
     --model_path ./output/scene_rgb_test_fixed_voxels \
-    --iterations 209 \
+    --gaussian_model_path ./output/scene_rgb_test_fixed_voxels \
+    --gaussian_iteration 50000 \
+    --iterations 25 \
     --num_cameras 400 \
     --cameras_per_step 20 \
     --voxel_size 0.02 \
     --min_points_per_voxel 1 \
     --max_initial_blocks 0 \
-    --fno_batch_size 1024 \
+    --fno_batch_size 512 \
     --checkpoint_interval 2 \
     --preview_views 3 \
-    --output_dir /n/holylfs05/LABS/pfister_lab/Lab/coxfs01/pfister_lab2/Lab/yuanxiuwang/fixed_voxel_static_128_splitting_prunning_neighbor_hotdog_002 \
+    --output_dir /n/holylfs05/LABS/pfister_lab/Lab/coxfs01/pfister_lab2/Lab/yuanxiuwang/fixed_voxel_static_128_splitting_prunning_neighbor_hotdog_3dgs \
     --flip_projection_y \
     --lifecycle_interval 10 \
     --max_blocks 0 \
@@ -46,9 +48,9 @@ python optimize_fixed_voxel_scene.py \
     --split_min_alive_weight 0.1 \
     --split_min_world_size 0 \
     --split_min_shape_gradient 0 \
-    --neighbor_activation_interval 5 \
-    --neighbor_candidate_count 500 \
-    --max_neighbor_activations_per_update 1000 \
+    --neighbor_activation_interval 20 \
+    --neighbor_candidate_count 5000 \
+    --max_neighbor_activations_per_update 2000 \
     --enable_hard_pruning \
     --dead_alive_threshold=2e-2 \
     --dead_intervals_before_prune 2 \
@@ -61,4 +63,4 @@ python optimize_fixed_voxel_scene.py \
     --use_tile_renderer \
     --surface_checkpoint=/n/holylfs05/LABS/pfister_lab/Lab/coxfs01/pfister_lab2/Lab/yuanxiuwang/best_surface.pt \
     --volume_checkpoint=/n/holylfs05/LABS/pfister_lab/Lab/coxfs01/pfister_lab2/Lab/yuanxiuwang/best_volume.pt \
-    --resume_checkpoint /n/holylfs05/LABS/pfister_lab/Lab/coxfs01/pfister_lab2/Lab/yuanxiuwang/fixed_voxel_static_128_splitting_prunning_neighbor_hotdog_002/checkpoint_iter_000198.pt
+    --resume_checkpoint /n/holylfs05/LABS/pfister_lab/Lab/coxfs01/pfister_lab2/Lab/yuanxiuwang/fixed_voxel_static_128_splitting_prunning_neighbor_hotdog_3dgs/checkpoint_iter_000012.pt
